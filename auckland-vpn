@@ -1,0 +1,207 @@
+#!/usr/bin/env bash
+#
+# auckland-vpn — a reliable wrapper around openconnect for the University of
+# Auckland FortiNet SSL VPN.
+#
+# What this fixes compared to the raw command you were using:
+#   * 2FA is generated automatically from a TOTP secret (no phone, no typing
+#     a code that just expired).
+#   * The VPN password is read from your macOS Keychain (with a protected-file
+#     fallback if Keychain can't prompt in your current shell).
+#   * --reconnect-timeout keeps the tunnel auto-reconnecting if it drops
+#     (this build has no --persistent flag).
+#   * Certificate trust uses the system's trusted CAs (the gateway cert is from
+#     DigiCert). We deliberately do NOT pin a specific cert, because the
+#     university's gateway certificate rotates — pinning would just break later.
+#   * The Homebrew vpnc-script (already installed) sets DNS correctly via
+#     scutil, which is the usual cause of "connected but nothing resolves".
+#
+# Usage:
+#   auckland-vpn setup     one-time: store password + TOTP secret
+#   auckland-vpn start     connect (asks for your Mac password once via sudo)
+#   auckland-vpn stop      disconnect
+#   auckland-vpn restart   stop, then start
+#   auckland-vpn status    is it running?
+#   auckland-vpn log       follow the connection log
+#   auckland-vpn pin       print the current server-cert fingerprint
+
+set -euo pipefail
+
+# ---- Configuration ----------------------------------------------------------
+# Your VPN username is NOT hardcoded here (keep it private). Set it via the
+# VPN_USER environment variable, or by adding a line  VPN_USER=yourname
+# to ~/.config/auckland-vpn/config (that file is yours, not part of this repo).
+CONFIG_FILE="$HOME/.config/auckland-vpn/config"
+VPN_USER="${VPN_USER:-}"
+if [ -z "$VPN_USER" ] && [ -f "$CONFIG_FILE" ]; then
+  # shellcheck source=/dev/null
+  . "$CONFIG_FILE"
+fi
+if [ -z "$VPN_USER" ]; then
+  echo "Set your VPN username: export VPN_USER=yourname  (or add 'VPN_USER=yourname' to $CONFIG_FILE)" >&2
+  exit 1
+fi
+VPN_HOST="connectvpn.auckland.ac.nz"
+VPN_SERVER="connectvpn.auckland.ac.nz/client"   # includes the "client" realm
+VPN_PROTO="fortinet"
+SCRIPT_PATH="/opt/homebrew/etc/vpnc/vpnc-script"
+OPENCONNECT_BIN="/opt/homebrew/bin/openconnect"
+SECRET_FILE="$HOME/.config/auckland-vpn/totp-secret"
+PASSWORD_FILE="$HOME/.config/auckland-vpn/vpn-password"
+KEYCHAIN_SVC="auckland-vpn"
+LOG_FILE="/tmp/auckland-vpn.log"
+
+# ---- Helpers ----------------------------------------------------------------
+die() { echo "Error: $*" >&2; exit 1; }
+
+cmd_status() {
+  if pgrep -f "openconnect.*$VPN_HOST" >/dev/null 2>&1; then
+    echo "openconnect is running (connected or connecting)."
+    echo "--- tunnel interfaces ---"
+    ifconfig -a 2>/dev/null | grep -E "^utun|inet " | head -10 || true
+  else
+    echo "Not connected."
+  fi
+}
+
+cmd_log() {
+  if [ -f "$LOG_FILE" ]; then
+    tail -n 50 -f "$LOG_FILE"
+  else
+    echo "No log file yet ($LOG_FILE). Run 'auckland-vpn start' first."
+  fi
+}
+
+# Store the TOTP secret (base32 string, or a full otpauth:// URI from a QR
+# decoder) in a mode-600 file openconnect reads with --token-secret=@FILE.
+cmd_secret() {
+  mkdir -p "$(dirname "$SECRET_FILE")"
+  echo "Paste your TOTP secret."
+  echo "  - a base32 string like JBSWY3DPEHPK3PXP, or"
+  echo "  - a full otpauth://totp/... URI (if you decoded the enrolment QR)"
+  printf "> "
+  read -r RAW
+  RAW="$(echo "$RAW" | tr -d '[:space:]')"
+  [ -z "$RAW" ] && die "no secret entered; aborted."
+  if [[ "$RAW" == otpauth://* ]]; then
+    SECRET="$RAW"
+  else
+    SECRET="base32:${RAW#base32:}"
+  fi
+  printf '%s\n' "$SECRET" >"$SECRET_FILE"
+  chmod 600 "$SECRET_FILE"
+  echo "Saved TOTP secret to $SECRET_FILE (mode 600)."
+}
+
+cmd_setup() {
+  cmd_secret
+  echo
+  echo "Enter your University of Auckland password."
+  echo "It is stored in your macOS Keychain (you'll get a system prompt to allow it)."
+  read -rs -p "> " PASS; echo
+  [ -z "$PASS" ] && die "no password entered; aborted."
+  if security add-generic-password -a "$VPN_USER" -s "$KEYCHAIN_SVC" -w "$PASS" -U 2>/tmp/auckland-vpn-keyerr; then
+    echo "Password saved to macOS Keychain."
+  else
+    echo "Keychain unavailable ($(cat /tmp/auckland-vpn-keyerr 2>/dev/null | head -1))."
+    echo "Falling back to a protected file instead."
+    printf '%s\n' "$PASS" >"$PASSWORD_FILE"
+    chmod 600 "$PASSWORD_FILE"
+    echo "Password saved to $PASSWORD_FILE (mode 600)."
+  fi
+  echo
+  echo "Optional: let 'auckland-vpn start' run without typing your Mac password."
+  echo "Copy and run this one line (it grants passwordless sudo for openconnect only):"
+  echo
+  echo "  echo '$(whoami) ALL=(root) NOPASSWD: /opt/homebrew/bin/openconnect, /usr/bin/pkill' | sudo tee /etc/sudoers.d/auckland-vpn && sudo chmod 440 /etc/sudoers.d/auckland-vpn"
+  echo
+  echo "Setup complete. Connect with:  auckland-vpn start"
+}
+
+cmd_start() {
+  [ -s "$SECRET_FILE" ] || die "TOTP secret missing. Run: auckland-vpn setup"
+  # Password: try Keychain first, then the protected-file fallback.
+  # (The "|| true" lets the Keychain lookup "fail" without tripping set -e.)
+  PASS="$(security find-generic-password -a "$VPN_USER" -s "$KEYCHAIN_SVC" -w 2>/dev/null || true)"
+  if [ -z "$PASS" ] && [ -s "$PASSWORD_FILE" ]; then
+    PASS="$(cat "$PASSWORD_FILE")"
+  fi
+  [ -z "$PASS" ] && die "VPN password not found (Keychain or $PASSWORD_FILE). Run: auckland-vpn setup"
+  [ -x "$SCRIPT_PATH" ] || die "vpnc-script not found at $SCRIPT_PATH"
+  # Proactively confirm passwordless sudo for openconnect is in place.
+  if ! sudo -n "$OPENCONNECT_BIN" --version >/dev/null 2>&1; then
+    echo "Passwordless sudo for openconnect is not set up. Run this once:"
+    echo "  sudo sh -c 'grep -q \"NOPASSWD: /opt/homebrew/bin/openconnect\" /etc/sudoers || echo \"\$(whoami) ALL=(root) NOPASSWD: /opt/homebrew/bin/openconnect, /usr/bin/pkill\" >> /etc/sudoers'"
+    echo "Then retry: auckland-vpn start"
+    exit 1
+  fi
+
+  echo "Connecting to $VPN_SERVER as $VPN_USER ..."
+  # openconnect reads the VPN password from stdin (--passwd-on-stdin) and the
+  # TOTP code from the secret file (--token-secret=@FILE). sudo runs it as
+  # root with no Mac-password prompt (NOPASSWD rule). The log is truncated
+  # each run so it always shows the latest attempt.
+  if ! printf '%s\n' "$PASS" | sudo "$OPENCONNECT_BIN" \
+      --protocol="$VPN_PROTO" \
+      --user="$VPN_USER" \
+      --passwd-on-stdin \
+      --token-mode=totp \
+      --token-secret="@$SECRET_FILE" \
+      --reconnect-timeout=300 \
+      --background \
+      --script="$SCRIPT_PATH" \
+      "$VPN_SERVER" >"$LOG_FILE" 2>&1; then
+    echo "Connection failed. See: auckland-vpn log"
+    exit 1
+  fi
+  echo "Launched in background. Check with: auckland-vpn status"
+  echo "Logs: auckland-vpn log"
+}
+
+cmd_stop() {
+  if pgrep -f "openconnect.*$VPN_HOST" >/dev/null 2>&1; then
+    sudo pkill -f "openconnect.*$VPN_HOST" && echo "Disconnecting..." || die "could not stop openconnect."
+  else
+    echo "Not connected."
+  fi
+}
+
+cmd_pin() {
+  echo | openssl s_client -connect "$VPN_HOST:443" -servername "$VPN_HOST" 2>/dev/null \
+    | awk '/-----BEGIN CERTIFICATE-----/{f=1} f{print} /-----END CERTIFICATE-----/{exit}' \
+    | openssl x509 -noout -fingerprint -sha256 2>/dev/null \
+    | sed 's/.*Fingerprint=//' | tr -d ':' | awk '{print "sha256:"$1}'
+}
+
+usage() {
+  cat <<EOF
+auckland-vpn — reliable University of Auckland VPN (FortiNet + TOTP 2FA)
+
+  setup     one-time: store VPN password (Keychain) + TOTP secret
+  start     connect (auto 2FA, auto-reconnect, pinned cert)
+  stop      disconnect
+  restart   stop then start
+  status    show whether openconnect is running
+  log       follow the connection log
+  pin       print the current server certificate fingerprint
+
+Examples:
+  auckland-vpn setup
+  auckland-vpn start
+  auckland-vpn status
+  auckland-vpn stop
+EOF
+}
+
+# ---- Dispatch ---------------------------------------------------------------
+case "${1:-start}" in
+  setup)    cmd_setup ;;
+  start)    cmd_start ;;
+  stop)     cmd_stop ;;
+  restart)  cmd_stop; sleep 1; cmd_start ;;
+  status)   cmd_status ;;
+  log)      cmd_log ;;
+  pin)      cmd_pin ;;
+  -h|--help|help) usage ;;
+  *) echo "Unknown command: $1"; usage; exit 1 ;;
+esac

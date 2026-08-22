@@ -118,3 +118,18 @@ if you ever want to inspect it, but pinning is not used.
 - **Sudo behaviour of `start`:** passwordless once `setup-sudo` is done;
   otherwise it asks for your Mac password once (in non-interactive shells it
   explains how to install the helper instead of hanging).
+- **Sleep/wake:** openconnect tries to reconnect for up to 5 minutes
+  (`--reconnect-timeout=300`). If your Mac slept longer than that, the tunnel
+  is dead — run `auckland-vpn restart` (or check `auckland-vpn status`, which
+  tells you connected vs connecting vs not connected).
+
+## Uninstall
+
+```bash
+auckland-vpn stop                                            # disconnect
+sudo rm /etc/sudoers.d/auckland-vpn                          # remove sudo rule
+sudo rm -rf /private/etc/auckland-vpn                        # remove helper + pidfile
+security delete-generic-password -s auckland-vpn             # remove stored password
+rm -rf ~/.config/auckland-vpn ~/.local/state/auckland-vpn    # remove config + logs
+rm /opt/homebrew/bin/auckland-vpn                            # remove the script itself
+```

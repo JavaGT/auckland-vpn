@@ -17,18 +17,7 @@
 #     scutil, which is the usual cause of "connected but nothing resolves".
 #
 # Usage:
-#   auckland-vpn setup      one-time: store password + TOTP secret (+ optional
-#                           passwordless-sudo helper install)
-#   auckland-vpn setup-sudo one sudo prompt: install the root-owned helper +
-#                           restricted sudoers rule (re-run after upgrading!)
-#   auckland-vpn start      connect — without your Mac password once setup-sudo
-#                           is done; otherwise asks for it once
-#   auckland-vpn stop       disconnect
-#   auckland-vpn restart    stop, confirm gone, then start
-#   auckland-vpn status     connected? (pid + tunnel IP when up)
-#   auckland-vpn log        last 50 log lines ('log -f' follows live)
-#   auckland-vpn pin        print the current server-cert fingerprint
-#   auckland-vpn doctor     check prerequisites; OK/FIX line per item
+#   see: auckland-vpn help        (canonical; keep all command docs there)
 
 set -euo pipefail
 

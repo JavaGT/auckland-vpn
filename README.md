@@ -60,16 +60,21 @@ before running `auckland-vpn setup` / `start`:
      system prompt to allow it; if Keychain can't prompt in your shell it falls
      back to a protected file).
 
-   It also prints an *optional* one-liner that lets `auckland-vpn start` run
-   without asking for your Mac password. Recommended for true one-command use.
+   It also offers an *optional* one-liner that installs a restricted,
+   root-owned helper so `auckland-vpn start` runs without typing your Mac
+   password. Without it, everything still works — `start` just asks for your
+   Mac password once per connection instead.
 
 ## Daily use
 
 ```bash
-auckland-vpn start      # connect (auto 2FA + auto-reconnect)
-auckland-vpn status     # is it up?
-auckland-vpn log        # watch the connection log
+auckland-vpn start      # connect (auto 2FA + auto-reconnect); verifies the
+                        # tunnel really came up before saying so
+auckland-vpn status     # Connected as you (pid, tunnel IP) / Connecting... /
+                        # Not connected.
+auckland-vpn log        # last 50 log lines ('auckland-vpn log -f' follows)
 auckland-vpn stop       # disconnect
+auckland-vpn restart    # stop, confirm the old process is gone, start again
 ```
 
 ## Certificates
@@ -86,3 +91,21 @@ if you ever want to inspect it, but pinning is not used.
   or, if Keychain couldn't be used, in `~/.config/auckland-vpn/vpn-password`
   (mode 600).
 - To change either later: `auckland-vpn setup` (it re-runs the wizard).
+- **Logs** live in your private state dir:
+  `~/.local/state/auckland-vpn/auckland-vpn.log` (mode 700 dir, mode 600 log;
+  honour `XDG_STATE_HOME`). Each start rotates the previous attempt to
+  `auckland-vpn.log.prev` and stamps a `==== auckland-vpn start <date> ====`
+  banner, so history survives reboots and you can compare a good run with a
+  bad one. This tool creates nothing under `/tmp`.
+- **`start` verifies the tunnel**: it polls for connected evidence for up to
+  ~15 s ("verifying . . ."), prints `Connected as <user>. Tunnel IP: ...` on
+  success, and on failure dumps the last 15 log lines inline before pointing
+  at `auckland-vpn log`.
+- **One tunnel at a time**: starting while already connected is refused —
+  use `auckland-vpn restart`, which confirms the old process is gone first.
+- **After upgrading this tool, re-run `auckland-vpn setup-sudo`.** The
+  privileged helper embeds the log path and other settings at install time,
+  so an old helper keeps writing to old locations until regenerated.
+- **Sudo behaviour of `start`:** passwordless once `setup-sudo` is done;
+  otherwise it asks for your Mac password once (in non-interactive shells it
+  explains how to install the helper instead of hanging).

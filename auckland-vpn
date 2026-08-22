@@ -20,12 +20,13 @@
 #   auckland-vpn setup      one-time: store password + TOTP secret (+ optional
 #                           passwordless-sudo helper install)
 #   auckland-vpn setup-sudo one sudo prompt: install the root-owned helper +
-#                           restricted sudoers rule
-#   auckland-vpn start      connect (passwordless once setup-sudo is done)
-#   auckland-vpn stop      disconnect
-#   auckland-vpn restart   stop, then start
-#   auckland-vpn status    is it running?
-#   auckland-vpn log       follow the connection log
+#                           restricted sudoers rule (re-run after upgrading!)
+#   auckland-vpn start      connect — without your Mac password once setup-sudo
+#                           is done; otherwise asks for it once
+#   auckland-vpn stop       disconnect
+#   auckland-vpn restart    stop, confirm gone, then start
+#   auckland-vpn status     connected? (pid + tunnel IP when up)
+#   auckland-vpn log        last 50 log lines ('log -f' follows live)
 #   auckland-vpn pin       print the current server-cert fingerprint
 
 set -euo pipefail
@@ -52,8 +53,13 @@ OPENCONNECT_BIN="/opt/homebrew/bin/openconnect"
 SECRET_FILE="$HOME/.config/auckland-vpn/totp-secret"
 PASSWORD_FILE="$HOME/.config/auckland-vpn/vpn-password"
 KEYCHAIN_SVC="auckland-vpn"
-LOG_FILE="/tmp/auckland-vpn.log"
-# Privileged helper + sudoers install targets (see cmd_setup_sudo).
+# Private per-user state (mode 700). Logs live here instead of /tmp, so they
+# survive reboots, are not world-readable, and keep history across attempts.
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/auckland-vpn"
+LOG_FILE="$STATE_DIR/auckland-vpn.log"
+# Privileged helper + sudoers install targets (see cmd_setup_sudo). The
+# generated helper bakes LOG_FILE/PID_FILE in at setup-sudo time — after
+# changing paths or upgrading, re-run 'auckland-vpn setup-sudo'.
 HELPER_DIR="/private/etc/auckland-vpn"
 HELPER_BIN="$HELPER_DIR/helper"
 PID_FILE="$HELPER_DIR/vpn.pid"
@@ -67,6 +73,119 @@ die() { echo "Error: $*" >&2; exit 1; }
 openconnect_supports_pid_file() {
   [ -x "$OPENCONNECT_BIN" ] || return 1
   "$OPENCONNECT_BIN" --help 2>&1 | grep -q -- '--pid-file'
+}
+
+# Create the private state directory lazily (only log-writing commands need
+# it). Explicit chmod so a directory left by an older version gets tightened
+# too; mode 700 keeps the log and its rotation history user-only.
+ensure_state_dir() {
+  if ! { mkdir -p "$STATE_DIR" && chmod 700 "$STATE_DIR"; }; then
+    die "cannot create state dir at $STATE_DIR"
+  fi
+}
+
+# PID of a live openconnect for OUR host, else nothing. The pidfile is only
+# trusted when its recorded process really is openconnect (guards against PID
+# reuse); a missing/stale/corrupt/unreadable pidfile falls back to a scoped
+# pgrep. Detection only — actual killing goes through the helper (or the
+# scoped legacy pkill in cmd_stop), never through this.
+running_vpn_pid() {
+  local pid pids
+  pid="$(cat "$PID_FILE" 2>/dev/null)" || true
+  if [[ "$pid" =~ ^[0-9]+$ ]] \
+      && ps -p "$pid" -o command= 2>/dev/null | grep -q openconnect; then
+    printf '%s\n' "$pid"
+    return 0
+  fi
+  pids="$(pgrep -f "openconnect.*$VPN_HOST" 2>/dev/null)" || true
+  printf '%s\n' "${pids%%$'\n'*}"
+}
+
+# Last error-looking line of the current log (empty when none or no log).
+last_log_error() {
+  [ -f "$LOG_FILE" ] || return 0
+  local hit
+  hit="$(grep -iE 'error|failed|denied|refused|invalid' "$LOG_FILE" 2>/dev/null | tail -n 1)" || true
+  [ -n "$hit" ] && printf '%s\n' "$hit"
+  return 0
+}
+
+# Best-effort tunnel IPv4 from this attempt's log: prefer openconnect's
+# "Connected as A.B.C.D" line, else an inet address logged next to a utun
+# interface. Empty output when neither appears. (grep -o, not gawk match():
+# macOS ships BSD awk without the 3-argument match().)
+tunnel_ip_from_log() {
+  local ip
+  ip="$(grep -iEo 'connected as ([0-9]{1,3}\.){3}[0-9]{1,3}' "$LOG_FILE" 2>/dev/null \
+        | head -n 1 | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}')" || true
+  if [ -z "$ip" ]; then
+    ip="$(grep -A2 -i 'utun' "$LOG_FILE" 2>/dev/null \
+          | grep -Eo 'inet ([0-9]{1,3}\.){3}[0-9]{1,3}' | head -n 1 \
+          | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}')" || true
+  fi
+  [ -n "$ip" ] && printf '%s\n' "$ip"
+  return 0
+}
+
+# The helper exiting 0 only proves launch began. Poll briefly (bounded ~15s)
+# for hard evidence — recorded pidfile plus a connected marker in this
+# attempt's log — printing progress so the pause doesn't feel hung.
+verify_tunnel_started() {
+  local waited=0
+  printf 'verifying'
+  while [ "$waited" -lt 30 ]; do
+    if [ -s "$PID_FILE" ] && grep -qiE 'connected|established|tunnel' "$LOG_FILE" 2>/dev/null; then
+      printf '\n'
+      return 0
+    fi
+    sleep 0.5
+    waited=$((waited + 1))
+    printf ' .'
+  done
+  printf '\n'
+  return 1
+}
+
+# Distinct, actionable failure report: show the log tail inline and point at
+# the full log — but never dress a log-write problem up as "Connection failed".
+report_start_failure() {
+  if [ -s "$LOG_FILE" ]; then
+    echo "--- last 15 log lines ($LOG_FILE) ---"
+    tail -n 15 "$LOG_FILE" 2>/dev/null || true
+    echo "Connection failed. Full log: auckland-vpn log"
+  else
+    echo "Connection failed — nothing was written to $LOG_FILE (cannot write log there?)."
+  fi
+  echo "(If sudo refused permission instead, re-run: auckland-vpn setup-sudo)"
+  exit 1
+}
+
+# Refuse to stack a second tunnel on top of a healthy one: two openconnects
+# fight over utun/DNS/routes. Use 'restart' to replace a running tunnel.
+refuse_if_already_running() {
+  local pid
+  pid="$(running_vpn_pid || true)"
+  if [ -n "$pid" ]; then
+    die "already connected/starting (pid $pid); use: auckland-vpn restart"
+  fi
+}
+
+# After stop, confirm the old process is REALLY gone before starting anew:
+# SIGTERM delivery is not process death, and launching beside a dying tunnel
+# means two clients fighting over utun/DNS/routes. Bounded ~10s, then one
+# escalation through the helper (whose stop path escalates to SIGKILL).
+wait_until_vpn_gone() {
+  local waited=0 pid
+  while :; do
+    pid="$(running_vpn_pid || true)"
+    [ -z "$pid" ] && return 0
+    [ "$waited" -ge 20 ] && break
+    sleep 0.5
+    waited=$((waited + 1))
+  done
+  if [ -x "$HELPER_BIN" ]; then
+    sudo -n "$HELPER_BIN" stop >/dev/null 2>&1 || true
+  fi
 }
 
 # Emit the privileged helper script with all site values baked in at
@@ -104,17 +223,22 @@ usage() {
 }
 
 # Tamper check for the trusted path: every component from the path itself up
-# to / must exist, be owned by root, and carry no group/other write bit. Used
-# on the binaries 'start' execs — sudo would run them as root, so a writable
-# ancestor would hand arbitrary root code execution to any local user.
+# to / must exist, be owned by root or the invoking user, and carry no
+# WORLD-writable bit. Used on the binaries 'start' execs — sudo runs them as
+# root, so a world-writable ancestor would hand arbitrary root code execution
+# to any local user. Group-write is deliberately tolerated: stock Homebrew on
+# Apple Silicon ships group 'admin'-writable dirs, and admin members already
+# hold full sudo, so the rule grants them nothing new.
 path_is_trusted() {
   local p="$1" perms t hops=0
+  local ok_uid="${SUDO_UID:-$(id -u)}"
   while :; do
     [ -e "$p" ] || return 1
-    [ "$(stat -f '%u' "$p")" = "0" ] || return 1
+    local u; u="$(stat -f '%u' "$p")"
+    [ "$u" = "$ok_uid" ] || [ "$u" = "0" ] || return 1
     perms="$(stat -f '%Sp' "$p")"          # e.g. "-rwxr-xr-x"
     case "$perms" in
-      ?????w*|????????w*) return 1 ;;      # group-write or other-write set
+      ????????w*) return 1 ;;              # other-write set: any user can tamper
     esac
     if [ -L "$p" ]; then                   # keep checking via the link target
       hops=$((hops + 1))
@@ -147,10 +271,22 @@ cmd_start() {
   [ -n "$pass" ] || die "no VPN password received on stdin"
 
   umask 077
-  : >"$LOG_FILE"
-  # Log is truncated as root, but hand ownership to the invoking user so
-  # 'auckland-vpn log' (running unprivileged) can tail it. Root keeps write
-  # access regardless of the file's mode.
+  # Rotate the previous attempt to .prev instead of truncating, so history
+  # survives reboots and retries (.prev = the run before this one). mv is a
+  # rename: it moves even a hostile symlink AT the log path out of the way,
+  # after which >> creates a fresh regular file — the link can't redirect us.
+  if [ -f "$LOG_FILE" ] || [ -L "$LOG_FILE" ]; then
+    if ! mv -f "$LOG_FILE" "$LOG_FILE.prev"; then
+      die "cannot rotate log at $LOG_FILE"
+    fi
+  fi
+  # Append a dated banner, then openconnect's output. A failed write must be
+  # reported as itself, not as "Connection failed".
+  if ! printf '==== auckland-vpn start %s ====\n' "$(date '+%Y-%m-%d %H:%M:%S')" >>"$LOG_FILE"; then
+    die "cannot write log at $LOG_FILE"
+  fi
+  # Log is created as root; hand ownership to the invoking user so
+  # 'auckland-vpn log' (running unprivileged) can read it. Mode stays 600.
   if [ -n "${SUDO_USER:-}" ]; then chown "$SUDO_USER" "$LOG_FILE"; fi
   rm -f "$PID_FILE"
 
@@ -179,6 +315,9 @@ cmd_start() {
     sleep 0.5
     waited=$((waited + 1))
   done
+  # Hand the pidfile to the invoking user too: the wrapper reads it for
+  # status, the already-running guard, and restart's wait-until-gone.
+  if [ -n "${SUDO_USER:-}" ]; then chown "$SUDO_USER" "$PID_FILE"; fi
   echo "VPN started (pid $(cat "$PID_FILE")). Log: $LOG_FILE"
 }
 
@@ -253,6 +392,7 @@ detect_legacy_rule() {
 }
 
 # The canonical explanation shown wherever passwordless setup is missing.
+# Note: 'start' works without it — it just asks for the Mac password once.
 print_sudoers_hint() {
   echo "Passwordless start is not installed. Run once:"
   echo "  auckland-vpn setup-sudo"
@@ -260,6 +400,7 @@ print_sudoers_hint() {
   echo "allowing ONLY 'helper start' / 'helper stop' — never raw openconnect"
   echo "(granting the raw binary allowed arbitrary root code execution via"
   echo "--script=, and the old pkill grant could kill any root process)."
+  echo "Until then, 'auckland-vpn start' simply asks for your Mac password once."
   detect_legacy_rule /etc/sudoers /etc/sudoers.d/* \
     || echo "Fix the warning(s) above so they cannot undermine the new rule." >&2
   return 0
@@ -272,6 +413,7 @@ cmd_setup_sudo() {
   [ "$(id -u)" -ne 0 ] || die "run this as your normal user; it will ask for your Mac password once."
   openconnect_supports_pid_file \
     || die "$OPENCONNECT_BIN lacks --pid-file (needed for safe stop). Run: brew upgrade openconnect"
+  ensure_state_dir
 
   local tmp
   tmp="$(mktemp -d "${TMPDIR:-/tmp}/auckland-vpn-setup.XXXXXX")"
@@ -302,26 +444,57 @@ cmd_setup_sudo() {
   echo "Done. Passwordless sudo is now limited to exactly:"
   echo "  sudo -n $HELPER_BIN start"
   echo "  sudo -n $HELPER_BIN stop"
+  echo "Re-run 'auckland-vpn setup-sudo' after upgrading this tool: the helper"
+  echo "embeds the log path and other settings at generation time."
   echo "If any legacy-rule lines were printed above, remove them:"
   echo "  sudo visudo (for /etc/sudoers) or: sudo rm /etc/sudoers.d/<offending-file>"
 }
 
+# Truthful status: distinguish connected (live process + connected evidence
+# in this attempt's log), still connecting, and not connected — with the last
+# error line from the log when the previous attempt failed.
 cmd_status() {
-  if pgrep -f "openconnect.*$VPN_HOST" >/dev/null 2>&1; then
-    echo "openconnect is running (connected or connecting)."
-    echo "--- tunnel interfaces ---"
-    ifconfig -a 2>/dev/null | grep -E "^utun|inet " | head -10 || true
-  else
+  local pid ip last_err
+  pid="$(running_vpn_pid || true)"
+  if [ -z "$pid" ]; then
     echo "Not connected."
+    last_err="$(last_log_error || true)"
+    if [ -n "$last_err" ]; then
+      echo "Last attempt failed: $last_err"
+    fi
+    return 0
+  fi
+  if grep -qiE 'connected|established|tunnel' "$LOG_FILE" 2>/dev/null; then
+    ip="$(tunnel_ip_from_log || true)"
+    if [ -n "$ip" ]; then
+      echo "Connected as $VPN_USER (pid $pid, IP $ip)."
+    else
+      echo "Connected as $VPN_USER (pid $pid)."
+    fi
+  else
+    echo "Connecting... (pid $pid)"
   fi
 }
 
+# Default: print the last 50 lines and exit. 'log -f' (or 'log follow')
+# streams new output until Ctrl-C.
 cmd_log() {
-  if [ -f "$LOG_FILE" ]; then
-    tail -n 50 -f "$LOG_FILE"
-  else
+  if [ ! -f "$LOG_FILE" ]; then
     echo "No log file yet ($LOG_FILE). Run 'auckland-vpn start' first."
+    return 1
   fi
+  case "${1:-}" in
+    -f|--follow|follow)
+      echo "(Ctrl-C to stop following)"
+      tail -n 50 -f "$LOG_FILE"
+      ;;
+    "")
+      tail -n 50 "$LOG_FILE"
+      ;;
+    *)
+      die "usage: auckland-vpn log [-f]"
+      ;;
+  esac
 }
 
 # Store the TOTP secret (base32 string, or a full otpauth:// URI from a QR
@@ -352,10 +525,14 @@ cmd_setup() {
   echo "It is stored in your macOS Keychain (you'll get a system prompt to allow it)."
   read -rs -p "> " PASS; echo
   [ -z "$PASS" ] && die "no password entered; aborted."
-  if security add-generic-password -a "$VPN_USER" -s "$KEYCHAIN_SVC" -w "$PASS" -U 2>/tmp/auckland-vpn-keyerr; then
+  # Keychain errors go to our private state dir — this tool must not leave
+  # files in /tmp (world-writable, wiped on reboot).
+  ensure_state_dir
+  local keyerr="$STATE_DIR/keychain-error.txt"
+  if security add-generic-password -a "$VPN_USER" -s "$KEYCHAIN_SVC" -w "$PASS" -U 2>"$keyerr"; then
     echo "Password saved to macOS Keychain."
   else
-    echo "Keychain unavailable ($(cat /tmp/auckland-vpn-keyerr 2>/dev/null | head -1))."
+    echo "Keychain unavailable ($(head -n 1 "$keyerr" 2>/dev/null || true))."
     echo "Falling back to a protected file instead."
     printf '%s\n' "$PASS" >"$PASSWORD_FILE"
     chmod 600 "$PASSWORD_FILE"
@@ -387,34 +564,80 @@ cmd_start() {
     print_sudoers_hint
     exit 1
   fi
+  refuse_if_already_running
+  ensure_state_dir
 
   echo "Connecting to $VPN_SERVER as $VPN_USER ..."
-  # The root-owned helper runs openconnect with fixed arguments (baked in at
-  # setup-sudo time); sudoers allows exactly 'helper start', nothing else.
-  # The password goes in on stdin and the helper truncates the log each run.
-  if ! printf '%s\n' "$PASS" | sudo -n "$HELPER_BIN" start; then
-    echo "Connection failed. See: auckland-vpn log"
-    echo "(If sudo refused permission, re-run: auckland-vpn setup-sudo)"
+  # Passwordless sudo first ('sudo -n true' probes without prompting — it
+  # covers both the installed rule and a cached timestamp). If sudo can't run
+  # non-interactively but a human is attached, ask ONCE via plain sudo; in a
+  # non-interactive shell, explain instead of hanging. A launch that fails
+  # AFTER sudo worked is a connection problem, reported from the log.
+  local passwordless=1
+  if sudo -n true 2>/dev/null; then
+    if ! printf '%s\n' "$PASS" | sudo -n "$HELPER_BIN" start; then
+      report_start_failure   # exits
+    fi
+  elif [ -t 0 ]; then
+    passwordless=0
+    echo "(Passwordless sudo not set up — asking for your Mac password once.)"
+    if ! printf '%s\n' "$PASS" | sudo "$HELPER_BIN" start; then
+      report_start_failure   # exits
+    fi
+  else
+    echo "Cannot ask for your Mac password in this non-interactive shell."
+    print_sudoers_hint
     exit 1
   fi
-  echo "Launched in background. Check with: auckland-vpn status"
-  echo "Logs: auckland-vpn log"
+
+  # Launch succeeded; now confirm the tunnel actually came up before any
+  # green light (wrong password / expired TOTP surface here).
+  if ! verify_tunnel_started; then
+    report_start_failure   # exits
+  fi
+
+  local ip
+  ip="$(tunnel_ip_from_log || true)"
+  if [ -n "$ip" ]; then
+    echo "Connected as $VPN_USER. Tunnel IP: $ip"
+  else
+    echo "Connected as $VPN_USER."
+  fi
+  if [ "$passwordless" -eq 0 ]; then
+    echo "Tip: run 'auckland-vpn setup-sudo' once to connect without your Mac password."
+  fi
 }
 
 cmd_stop() {
+  # Nothing to stop (no live process, no pidfile): say so without bothering
+  # sudo — keeps 'restart' quiet when nothing was running.
+  local pid
+  pid="$(running_vpn_pid || true)"
+  if [ -z "$pid" ] && [ ! -e "$PID_FILE" ]; then
+    echo "Not connected."
+    return 0
+  fi
   # Preferred path: the root-owned helper kills the exact recorded PID.
   if [ -x "$HELPER_BIN" ]; then
     if sudo -n "$HELPER_BIN" stop; then
-      exit 0
+      return 0
     fi
-    die "'$HELPER_BIN stop' failed (stale pidfile or sudoers rule?). Re-run: auckland-vpn setup-sudo"
+    echo "Warning: '$HELPER_BIN stop' failed (missing/stale/corrupt pidfile," >&2
+    echo "         or sudoers rule?). Falling back to a scoped pkill." >&2
   fi
-  # Fallback while no helper is installed: legacy broad pkill. Kept only so
-  # 'stop' still works pre-setup; prefer installing the helper.
-  if pgrep -f "openconnect.*$VPN_HOST" >/dev/null 2>&1; then
-    echo "Warning: helper not installed; using broad pkill fallback." >&2
-    echo "         Run 'auckland-vpn setup-sudo' to switch to the safe per-PID stop." >&2
-    if sudo pkill -f "openconnect.*$VPN_HOST"; then
+  stop_legacy_fallback
+}
+
+# Fallback when no helper is installed (or it failed): kill by pattern. The
+# [o] character class stops our OWN argv chain from matching — a plain 'pkill
+# -f' run via sudo sees the pattern inside sudo's argv, killed its own parent,
+# and made 'stop' die with a false "could not stop openconnect".
+stop_legacy_fallback() {
+  local pat="[o]penconnect.*$VPN_HOST"
+  if pgrep -f "$pat" >/dev/null 2>&1; then
+    echo "Warning: helper unavailable; killing openconnect by pattern." >&2
+    echo "         Run 'auckland-vpn setup-sudo' for the safe per-PID stop." >&2
+    if sudo pkill -f "$pat"; then
       echo "Disconnecting..."
     else
       die "could not stop openconnect."
@@ -422,6 +645,15 @@ cmd_stop() {
   else
     echo "Not connected."
   fi
+}
+
+# restart = stop, WAIT until the old process is really gone (SIGTERM delivery
+# is not death — a blind sleep launched a second tunnel beside a dying one),
+# then start. cmd_start's already-running guard backs this up.
+cmd_restart() {
+  cmd_stop
+  wait_until_vpn_gone
+  cmd_start
 }
 
 cmd_pin() {
@@ -437,11 +669,12 @@ auckland-vpn — reliable University of Auckland VPN (FortiNet + TOTP 2FA)
 
   setup       one-time: store VPN password (Keychain) + TOTP secret
   setup-sudo  one sudo prompt: install root-owned helper + restricted sudoers rule
-  start       connect (auto 2FA, auto-reconnect, pinned cert)
+  start       connect (auto 2FA, auto-reconnect; verifies the tunnel came up;
+              asks for your Mac password once unless setup-sudo is done)
   stop        disconnect
-  restart     stop then start
-  status      show whether openconnect is running
-  log         follow the connection log
+  restart     stop, confirm gone, then start
+  status      Connected as ... (pid, IP) / Connecting... / Not connected.
+  log         last 50 log lines ('log -f' follows until Ctrl-C)
   pin         print the current server certificate fingerprint
 
 Examples:
@@ -460,9 +693,9 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     setup-sudo)  cmd_setup_sudo ;;
     start)       cmd_start ;;
     stop)        cmd_stop ;;
-    restart)     cmd_stop; sleep 1; cmd_start ;;
+    restart)     cmd_restart ;;
     status)      cmd_status ;;
-    log)         cmd_log ;;
+    log)         shift; cmd_log "$@" ;;
     pin)         cmd_pin ;;
     -h|--help|help) usage ;;
     *) echo "Unknown command: $1"; usage; exit 1 ;;

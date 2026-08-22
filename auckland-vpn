@@ -106,9 +106,18 @@ load_config() {
     case "$trimmed" in
       \"*\" ) trimmed="${trimmed#\"}"; trimmed="${trimmed%\"}" ;;
       \'*\' ) trimmed="${trimmed#\'}"; trimmed="${trimmed%\'}" ;;
+      \"*|*\"|\'*|*\')
+        die "$CONFIG_FILE:$n: VPN_USER has unbalanced quotes."
+        ;;
     esac
     if [ -z "$trimmed" ]; then
       die "$CONFIG_FILE:$n: VPN_USER has an empty value."
+    fi
+    if [[ "$trimmed" != *[![:space:]A-Za-z0-9@._-]* ]]; then :; else
+      die "$CONFIG_FILE:$n: VPN_USER contains unsupported characters (allowed: letters, digits, @ . _ -)."
+    fi
+    if [ -n "${VPN_USER:-}" ] && [ "$VPN_USER" != "$trimmed" ]; then
+      die "$CONFIG_FILE:$n: duplicate conflicting VPN_USER lines."
     fi
     VPN_USER="$trimmed"
   done <"$CONFIG_FILE"
@@ -239,16 +248,26 @@ last_log_error() {
   return 0
 }
 
-# Best-effort tunnel IPv4 from this attempt's log: prefer openconnect's
+# Just the CURRENT attempt's log text (everything after the most recent
+# '==== auckland-vpn start' banner). Verification/status must not be fooled
+# by connected-markers from a PREVIOUS successful attempt still sitting in
+# the append-only log above this run's banner.
+attempt_log() {
+  awk '/^==== auckland-vpn start/{buf=""; seen=1} seen {buf = buf $0 "\n"} END{printf "%s", buf}' "$LOG_FILE" 2>/dev/null
+}
+
+# Best-effort tunnel IPv4 from THIS attempt's log: prefer openconnect's
 # "Connected as A.B.C.D" line, else an inet address logged next to a utun
 # interface. Empty output when neither appears. (grep -o, not gawk match():
 # macOS ships BSD awk without the 3-argument match().)
 tunnel_ip_from_log() {
-  local ip
-  ip="$(grep -iEo 'connected as ([0-9]{1,3}\.){3}[0-9]{1,3}' "$LOG_FILE" 2>/dev/null \
+  local ip attempt
+  attempt="$(attempt_log)" || true
+  [ -n "$attempt" ] || return 0
+  ip="$(grep -iEo 'connected as ([0-9]{1,3}\.){3}[0-9]{1,3}' <<<"$attempt" \
         | head -n 1 | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}')" || true
   if [ -z "$ip" ]; then
-    ip="$(grep -A2 -i 'utun' "$LOG_FILE" 2>/dev/null \
+    ip="$(grep -A2 -i 'utun' <<<"$attempt" \
           | grep -Eo 'inet ([0-9]{1,3}\.){3}[0-9]{1,3}' | head -n 1 \
           | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}')" || true
   fi
@@ -257,13 +276,16 @@ tunnel_ip_from_log() {
 }
 
 # The helper exiting 0 only proves launch began. Poll briefly (bounded ~15s)
-# for hard evidence — recorded pidfile plus a connected marker in this
-# attempt's log — printing progress so the pause doesn't feel hung.
+# for hard evidence — recorded pidfile plus a STRONG connected marker
+# ('Connected as <ip>' or 'Established DTLS/TLS') in THIS attempt's log only
+# (a bare word like 'tunnel' proves nothing) — printing progress so the pause
+# doesn't feel hung.
 verify_tunnel_started() {
   local waited=0
   printf 'verifying'
   while [ "$waited" -lt 30 ]; do
-    if [ -s "$PID_FILE" ] && grep -qiE 'connected|established|tunnel' "$LOG_FILE" 2>/dev/null; then
+    if [ -s "$PID_FILE" ] \
+        && attempt_log | grep -qiE 'connected as|established (dtls|tls)'; then
       printf '\n'
       return 0
     fi
@@ -331,6 +353,13 @@ generate_helper() {
   printf '%s\n' "#   $HELPER_BIN stop"
   printf '%s\n' '# All site values below are fixed at generation time. To change them,'
   printf '%s\n' '# edit the generator in the auckland-vpn script and re-run setup-sudo.'
+  printf '%s\n' '#'
+  printf '%s\n' '# Residual risk (accepted): openconnect and its libraries live in the'
+  printf '%s\n' '# user-writable Homebrew prefix. The tamper check below blocks OTHER'
+  printf '%s\n' '# local users and world/staff-writable paths; it cannot stop the account'
+  printf '%s\n' '# owner or another admin from swapping the binary — they already hold'
+  printf '%s\n' '# full sudo via the admin group, so nothing is granted that was not'
+  printf '%s\n' '# already theirs.'
   # Baked values (%q makes each safe as a literal shell assignment).
   printf 'OC=%q\n' "$OPENCONNECT_BIN"
   printf 'VPNC_SCRIPT=%q\n' "$SCRIPT_PATH"
@@ -352,22 +381,24 @@ usage() {
 }
 
 # Tamper check for the trusted path: every component from the path itself up
-# to / must exist, be owned by root or the invoking user, and carry no
-# WORLD-writable bit. Used on the binaries 'start' execs — sudo runs them as
-# root, so a world-writable ancestor would hand arbitrary root code execution
-# to any local user. Group-write is deliberately tolerated: stock Homebrew on
-# Apple Silicon ships group 'admin'-writable dirs, and admin members already
-# hold full sudo, so the rule grants them nothing new.
+# to / must exist, be owned by root or the invoking user, carry no
+# WORLD-writable bit, and allow group-write only for the 'admin' group
+# (gid 80 — stock Homebrew ships admin-writable dirs, and admin members
+# already hold full sudo, so that grants them nothing new). A staff/group-
+# writable or world-writable ancestor would hand root code execution to
+# arbitrary local users via the privileged helper.
 path_is_trusted() {
   local p="$1" perms t hops=0
   local ok_uid="${SUDO_UID:-$(id -u)}"
   while :; do
     [ -e "$p" ] || return 1
-    local u; u="$(stat -f '%u' "$p")"
+    local u g; u="$(stat -f '%u' "$p")"; g="$(stat -f '%g' "$p")"
     [ "$u" = "$ok_uid" ] || [ "$u" = "0" ] || return 1
     perms="$(stat -f '%Sp' "$p")"          # e.g. "-rwxr-xr-x"
     case "$perms" in
       ????????w*) return 1 ;;              # other-write set: any user can tamper
+      ?????w*)
+        [ "$g" = "80" ] || return 1 ;;     # group-write outside 'admin'
     esac
     if [ -L "$p" ]; then                   # keep checking via the link target
       hops=$((hops + 1))
@@ -475,7 +506,7 @@ cmd_stop() {
     waited=$((waited + 1))
   done
   rm -f "$PID_FILE"
-  echo "VPN stopped."
+  echo "Disconnected."
 }
 
 main() {
@@ -549,8 +580,11 @@ cmd_setup_sudo() {
     || die "$OPENCONNECT_BIN lacks --pid-file (needed for safe stop). Run: brew upgrade openconnect"
   ensure_state_dir
 
+  # Stage in the PRIVATE state dir, never /tmp: setup-sudo must not create
+  # files (even transient ones) in a world-writable, shared directory.
+  ensure_state_dir
   local tmp
-  tmp="$(mktemp -d "${TMPDIR:-/tmp}/auckland-vpn-setup.XXXXXX")"
+  tmp="$(mktemp -d "$STATE_DIR/setup.XXXXXX")" || die "cannot create staging dir in $STATE_DIR"
   trap 'rm -rf "$tmp"' EXIT
   generate_helper >"$tmp/helper"
   chmod 755 "$tmp/helper"
@@ -598,7 +632,7 @@ cmd_status() {
     fi
     return 0
   fi
-  if grep -qiE 'connected|established|tunnel' "$LOG_FILE" 2>/dev/null; then
+  if attempt_log | grep -qiE 'connected as|established (dtls|tls)'; then
     ip="$(tunnel_ip_from_log || true)"
     if [ -n "$ip" ]; then
       echo "Connected as $VPN_USER (pid $pid, IP $ip)."
@@ -702,6 +736,7 @@ cmd_setup() {
     echo "Password saved to macOS Keychain."
   else
     echo "Keychain unavailable ($(head -n 1 "$keyerr" 2>/dev/null || true))."
+    rm -f "$keyerr"   # diagnostics shown; don't leave the file behind
     echo "Falling back to a protected file instead."
     write_secret_file "$PASSWORD_FILE" "$PASS"
     echo "Password saved to $PASSWORD_FILE (mode 600)."
@@ -746,26 +781,25 @@ cmd_start() {
   ensure_state_dir
 
   echo "Connecting to $VPN_SERVER as $VPN_USER ..."
-  # Passwordless sudo first ('sudo -n true' probes without prompting — it
-  # covers both the installed rule and a cached timestamp). If sudo can't run
-  # non-interactively but a human is attached, ask ONCE via plain sudo; in a
-  # non-interactive shell, explain instead of hanging. A launch that fails
-  # AFTER sudo worked is a connection problem, reported from the log.
-  local passwordless=1
-  if sudo -n true 2>/dev/null; then
-    if ! printf '%s\n' "$PASS" | sudo -n "$HELPER_BIN" start; then
+  # Attempt the REAL command non-interactively first — 'sudo -n true' would
+  # always fail under our exact-args sudoers rule (only 'helper start'/'stop'
+  # are allowed, not arbitrary commands), and a cached root timestamp proves
+  # nothing about the rule. Classify the failure by stderr: "a password is
+  # required" means the rule isn't (yet) usable → ask once via plain sudo;
+  # any other failure (helper died, bad args, sudoers denial) is reported
+  # from the log instead of being misread as a missing password prompt.
+  local passwordless=1 sudo_err
+  if ! sudo_err="$(printf '%s\n' "$PASS" | sudo -n "$HELPER_BIN" start 2>&1 >/dev/null)"; then
+    if [ -t 0 ] && [[ "$sudo_err" == *"a password is required"* ]]; then
+      passwordless=0
+      echo "(Passwordless sudo not set up — asking for your Mac password once.)"
+      if ! printf '%s\n' "$PASS" | sudo "$HELPER_BIN" start; then
+        report_start_failure   # exits
+      fi
+    else
+      [ -n "$sudo_err" ] && echo "$sudo_err" >&2
       report_start_failure   # exits
     fi
-  elif [ -t 0 ]; then
-    passwordless=0
-    echo "(Passwordless sudo not set up — asking for your Mac password once.)"
-    if ! printf '%s\n' "$PASS" | sudo "$HELPER_BIN" start; then
-      report_start_failure   # exits
-    fi
-  else
-    echo "Cannot ask for your Mac password in this non-interactive shell."
-    print_sudoers_hint
-    exit 1
   fi
 
   # Launch succeeded; now confirm the tunnel actually came up before any
@@ -800,9 +834,18 @@ cmd_stop() {
     if sudo -n "$HELPER_BIN" stop; then
       return 0
     fi
+    # NEVER pattern-kill when a pidfile exists: the exact-PID guarantee is the
+    # point of the helper, and a broad pkill can signal another user's (or a
+    # stale) openconnect. Surface the failure instead.
     echo "Warning: '$HELPER_BIN stop' failed (missing/stale/corrupt pidfile," >&2
-    echo "         or sudoers rule?). Falling back to a scoped pkill." >&2
+    echo "         or sudoers rule?). NOT pattern-killing — fix the helper:" >&2
+    echo "           auckland-vpn setup-sudo" >&2
+    return 1
   fi
+  # Fallback ONLY while no helper is installed at all: kill by pattern. The
+  # [o] character class stops our OWN argv chain from matching — a plain 'pkill
+  # -f' run via sudo sees the pattern inside sudo's argv, killed its own parent,
+  # and made 'stop' die with a false "could not stop openconnect".
   stop_legacy_fallback
 }
 
@@ -903,10 +946,9 @@ cmd_doctor() {
   if [ ! -x "$HELPER_BIN" ]; then
     echo "FIX  privileged helper missing — 'start' will ask for your Mac password once. Install with: auckland-vpn setup-sudo"
     fixes=$((fixes + 1))
-  elif sudo -n -l "$HELPER_BIN" >/dev/null 2>&1; then
-    # -l <cmd> exits 0 only when sudoers policy actually allows this exact
-    # binary — a cached sudo timestamp or generic admin rights don't fool it
-    # the way 'sudo -n true' would.
+  elif sudo -n -l "$HELPER_BIN start" >/dev/null 2>&1 && sudo -n -l "$HELPER_BIN stop" >/dev/null 2>&1; then
+    # -l <cmd> exits 0 only when sudoers policy actually allows the command;
+    # checking BOTH exact invocations avoids false OK from generic privileges.
     echo "OK   helper installed ($HELPER_BIN) and passwordless sudo allows it"
   else
     echo "FIX  helper installed but sudoers does not allow it — re-run: auckland-vpn setup-sudo"

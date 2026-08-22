@@ -95,6 +95,9 @@ if you ever want to inspect it, but pinning is not used.
 
 ## Notes
 
+- Works with any Homebrew layout — Apple Silicon (`/opt/homebrew`), Intel
+  (`/usr/local`), or a custom prefix; the script resolves the right paths at
+  startup.
 - The TOTP secret lives at `~/.config/auckland-vpn/totp-secret` (mode 600).
 - The VPN password lives in your macOS Keychain (service name `auckland-vpn`),
   or, if Keychain couldn't be used, in `~/.config/auckland-vpn/vpn-password`

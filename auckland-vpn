@@ -27,32 +27,104 @@
 #   auckland-vpn restart    stop, confirm gone, then start
 #   auckland-vpn status     connected? (pid + tunnel IP when up)
 #   auckland-vpn log        last 50 log lines ('log -f' follows live)
-#   auckland-vpn pin       print the current server-cert fingerprint
+#   auckland-vpn pin        print the current server-cert fingerprint
+#   auckland-vpn doctor     check prerequisites; OK/FIX line per item
 
 set -euo pipefail
+
+# Private-by-default from the very first file touch: secrets, passwords, logs
+# and their directories are created 600/700 with no world-readable window.
+umask 077
 
 # ---- Configuration ----------------------------------------------------------
 # Your VPN username is NOT hardcoded here (keep it private). Set it via the
 # VPN_USER environment variable, or by adding a line  VPN_USER=yourname
 # to ~/.config/auckland-vpn/config (that file is yours, not part of this repo).
-CONFIG_FILE="$HOME/.config/auckland-vpn/config"
-VPN_USER="${VPN_USER:-}"
-if [ -z "$VPN_USER" ] && [ -f "$CONFIG_FILE" ]; then
-  # shellcheck source=/dev/null
-  . "$CONFIG_FILE"
+CONFIG_DIR="$HOME/.config/auckland-vpn"
+CONFIG_FILE="$CONFIG_DIR/config"
+SECRET_FILE="$CONFIG_DIR/totp-secret"
+PASSWORD_FILE="$CONFIG_DIR/vpn-password"
+KEYCHAIN_SVC="auckland-vpn"
+
+# Homebrew installs into a different prefix per architecture/setup. Resolve
+# ONCE here — before generate_helper bakes the values into the privileged
+# helper — so setup-sudo must be re-run only when these actually change.
+# The standard prefixes are tried first with cheap [ -x ] tests; spawning
+# 'brew --prefix' (~200ms) is a last resort so frequent commands like
+# status/log/help never pay for it.
+first_executable() {
+  local p
+  for p in "$@"; do
+    if [ -n "$p" ] && [ -x "$p" ]; then
+      printf '%s\n' "$p"
+      return 0
+    fi
+  done
+  return 1
+}
+
+BREW_PREFIX=""
+resolve_brew_prefix() {
+  [ -n "$BREW_PREFIX" ] || BREW_PREFIX="$(brew --prefix 2>/dev/null || true)"
+}
+if [ -x /opt/homebrew/bin/openconnect ]; then
+  OPENCONNECT_BIN=/opt/homebrew/bin/openconnect
+elif [ -x /usr/local/bin/openconnect ]; then
+  OPENCONNECT_BIN=/usr/local/bin/openconnect
+else
+  resolve_brew_prefix
+  OPENCONNECT_BIN="$(first_executable \
+    "${BREW_PREFIX:+$BREW_PREFIX/bin/openconnect}" \
+    "$(command -v openconnect 2>/dev/null || true)")" || OPENCONNECT_BIN=""
 fi
-if [ -z "$VPN_USER" ]; then
-  echo "Set your VPN username: export VPN_USER=yourname  (or add 'VPN_USER=yourname' to $CONFIG_FILE)" >&2
-  exit 1
+if [ -x /opt/homebrew/etc/vpnc/vpnc-script ]; then
+  SCRIPT_PATH=/opt/homebrew/etc/vpnc/vpnc-script
+elif [ -x /usr/local/etc/vpnc/vpnc-script ]; then
+  SCRIPT_PATH=/usr/local/etc/vpnc/vpnc-script
+else
+  resolve_brew_prefix
+  SCRIPT_PATH="$(first_executable \
+    "${BREW_PREFIX:+$BREW_PREFIX/etc/vpnc/vpnc-script}")" || SCRIPT_PATH=""
 fi
+# Empty means "missing": the require_* prereq gates report that with an
+# actionable install command instead of failing on a dead hardcoded path.
+
 VPN_HOST="connectvpn.auckland.ac.nz"
 VPN_SERVER="connectvpn.auckland.ac.nz/client"   # includes the "client" realm
 VPN_PROTO="fortinet"
-SCRIPT_PATH="/opt/homebrew/etc/vpnc/vpnc-script"
-OPENCONNECT_BIN="/opt/homebrew/bin/openconnect"
-SECRET_FILE="$HOME/.config/auckland-vpn/totp-secret"
-PASSWORD_FILE="$HOME/.config/auckland-vpn/vpn-password"
-KEYCHAIN_SVC="auckland-vpn"
+
+# Parse the optional config file WITHOUT executing it as shell code (the old
+# `. "$CONFIG_FILE"` ran arbitrary content on every invocation). Accepted:
+# blank lines, #comments, and 'VPN_USER=<username>' with optional matching
+# quotes. Anything else is rejected loudly, naming the file and line.
+load_config() {
+  [ -f "$CONFIG_FILE" ] || return 0
+  local line n=0 value trimmed
+  while IFS= read -r line || [ -n "$line" ]; do
+    n=$((n + 1))
+    line="${line%$'\r'}"
+    if [ -z "${line//[[:space:]]/}" ] || [[ "$line" == \#* ]]; then continue; fi
+    case "$line" in
+      VPN_USER=*) ;;
+      *)
+        die "$CONFIG_FILE:$n: unsupported line — only blank lines, #comments and VPN_USER=<username> are allowed:
+    $line"
+        ;;
+    esac
+    value="${line#VPN_USER=}"
+    trimmed="${value#"${value%%[![:space:]]*}"}"
+    trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
+    case "$trimmed" in
+      \"*\" ) trimmed="${trimmed#\"}"; trimmed="${trimmed%\"}" ;;
+      \'*\' ) trimmed="${trimmed#\'}"; trimmed="${trimmed%\'}" ;;
+    esac
+    if [ -z "$trimmed" ]; then
+      die "$CONFIG_FILE:$n: VPN_USER has an empty value."
+    fi
+    VPN_USER="$trimmed"
+  done <"$CONFIG_FILE"
+}
+
 # Private per-user state (mode 700). Logs live here instead of /tmp, so they
 # survive reboots, are not world-readable, and keep history across attempts.
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/auckland-vpn"
@@ -68,6 +140,35 @@ SUDOERS_FILE="/etc/sudoers.d/auckland-vpn"
 # ---- Helpers ----------------------------------------------------------------
 die() { echo "Error: $*" >&2; exit 1; }
 
+# Username gate for commands that NEED it (setup prompts instead; start and
+# setup-sudo refuse without it — restart inherits via start).
+require_vpn_user() {
+  [ -n "$VPN_USER" ] || die "Set your VPN username first: export VPN_USER=yourname  (or run: auckland-vpn setup)"
+}
+
+# Distinct, actionable prereq gates — always run BEFORE any sudo interaction,
+# so a missing binary is never misreported as a sudo/sudoers problem.
+require_openconnect() {
+  if [ -z "$OPENCONNECT_BIN" ] || [ ! -x "$OPENCONNECT_BIN" ]; then
+    die "openconnect not found — install with: brew install openconnect"
+  fi
+}
+require_vpnc_script() {
+  if [ -z "$SCRIPT_PATH" ] || [ ! -x "$SCRIPT_PATH" ]; then
+    die "vpnc-script missing — reinstall with: brew install openconnect (it provides etc/vpnc/vpnc-script)"
+  fi
+}
+require_prereqs() {
+  require_openconnect
+  require_vpnc_script
+}
+
+# Fill VPN_USER from the environment or the parsed config file. Runs after
+# die() exists so a malformed config can fail loudly. Never executes config
+# content as shell code.
+VPN_USER="${VPN_USER:-}"
+load_config
+
 # True when the installed openconnect supports --pid-file (v8+). The helper
 # relies on it so 'stop' can kill an exact recorded PID instead of pkill.
 openconnect_supports_pid_file() {
@@ -81,6 +182,45 @@ openconnect_supports_pid_file() {
 ensure_state_dir() {
   if ! { mkdir -p "$STATE_DIR" && chmod 700 "$STATE_DIR"; }; then
     die "cannot create state dir at $STATE_DIR"
+  fi
+}
+
+# Prepare ~/.config/auckland-vpn for credential storage: create it mode 700
+# and refuse to write secrets into a directory we do not own or that is
+# group/world-writable (a tamper risk, not just a privacy one).
+ensure_config_dir() {
+  # (mkdir -p, then an explicit chmod -m with -p only applies to the leaf.)
+  if ! mkdir -p "$CONFIG_DIR" 2>/dev/null; then
+    die "cannot create config dir at $CONFIG_DIR"
+  fi
+  chmod 700 "$CONFIG_DIR" 2>/dev/null || true   # tighten dirs left by older versions
+  local owner perms
+  owner="$(stat -f '%u' "$CONFIG_DIR" 2>/dev/null)" || die "cannot stat $CONFIG_DIR"
+  [ "$owner" = "$(id -u)" ] || die "$CONFIG_DIR is owned by uid $owner, not you — refusing to store credentials there."
+  perms="$(stat -f '%Lp' "$CONFIG_DIR" 2>/dev/null)" || die "cannot stat $CONFIG_DIR"
+  # Check the GROUP digit (second from the right) and OTHER digit (last) for a
+  # write bit (2/3/6/7). Works for 3- and 4-digit modes alike.
+  case "${perms: -2:1}${perms: -1}" in
+    [2367]*|*[2367])
+      die "$CONFIG_DIR is group/world-writable (mode $perms) — refusing to store credentials.
+Fix it with: chmod 700 '$CONFIG_DIR'"
+      ;;
+  esac
+}
+
+# Atomic, symlink-safe file write for secrets: never follow a symlink planted
+# at the destination; write to a temp file in the SAME directory (same
+# filesystem => rename works), chmod 600, then rename over the target.
+# Caller must have run ensure_config_dir first. Refuses symlink targets.
+write_secret_file() { # write_secret_file <path> <content>
+  local target="$1" content="$2" tmp
+  if [ -L "$target" ]; then
+    die "$target is a symlink — refusing to overwrite it (possible tampering). Remove it and re-run."
+  fi
+  tmp="$(mktemp "$CONFIG_DIR/.auckland-vpn.XXXXXX")" || die "cannot create temp file in $CONFIG_DIR"
+  if ! { printf '%s\n' "$content" >"$tmp" && chmod 600 "$tmp" && mv -f "$tmp" "$target"; }; then
+    rm -f "$tmp"
+    die "could not write $target"
   fi
 }
 
@@ -411,6 +551,11 @@ print_sudoers_hint() {
 # single sudo interaction. Never appends to /etc/sudoers.
 cmd_setup_sudo() {
   [ "$(id -u)" -ne 0 ] || die "run this as your normal user; it will ask for your Mac password once."
+  # Prereqs and username BEFORE anything else: the generated helper bakes the
+  # resolved binary paths and VPN_USER in at this moment, and no sudo prompt
+  # should happen while something as basic as openconnect is still missing.
+  require_prereqs
+  require_vpn_user
   openconnect_supports_pid_file \
     || die "$OPENCONNECT_BIN lacks --pid-file (needed for safe stop). Run: brew upgrade openconnect"
   ensure_state_dir
@@ -500,7 +645,7 @@ cmd_log() {
 # Store the TOTP secret (base32 string, or a full otpauth:// URI from a QR
 # decoder) in a mode-600 file openconnect reads with --token-secret=@FILE.
 cmd_secret() {
-  mkdir -p "$(dirname "$SECRET_FILE")"
+  ensure_config_dir
   echo "Paste your TOTP secret."
   echo "  - a base32 string like JBSWY3DPEHPK3PXP, or"
   echo "  - a full otpauth://totp/... URI (if you decoded the enrolment QR)"
@@ -513,30 +658,70 @@ cmd_secret() {
   else
     SECRET="base32:${RAW#base32:}"
   fi
-  printf '%s\n' "$SECRET" >"$SECRET_FILE"
-  chmod 600 "$SECRET_FILE"
+  # Atomic rename into place (no partial file, no symlink following).
+  write_secret_file "$SECRET_FILE" "$SECRET"
   echo "Saved TOTP secret to $SECRET_FILE (mode 600)."
 }
 
+# Append VPN_USER=<value> to the config file atomically (fresh copy in the
+# same dir, mode 600, rename into place — no partial file, no symlink chase).
+save_vpn_user_to_config() {
+  ensure_config_dir
+  local tmp existing=""
+  if [ -f "$CONFIG_FILE" ]; then
+    existing="$(cat "$CONFIG_FILE")"
+  fi
+  tmp="$(mktemp "$CONFIG_DIR/.auckland-vpn.XXXXXX")" || die "cannot create temp file in $CONFIG_DIR"
+  if ! { { [ -n "$existing" ] && printf '%s\n' "$existing"; printf 'VPN_USER=%s\n' "$VPN_USER"; } >"$tmp" \
+       && chmod 600 "$tmp" && mv -f "$tmp" "$CONFIG_FILE"; }; then
+    rm -f "$tmp"
+    die "could not update $CONFIG_FILE"
+  fi
+}
+
 cmd_setup() {
+  # setup can bootstrap the username itself (start/setup-sudo only refuse).
+  if [ -z "$VPN_USER" ]; then
+    printf 'University username: '
+    read -r VPN_USER || true   # EOF must fall through to the empty check below
+    VPN_USER="${VPN_USER#"${VPN_USER%%[![:space:]]*}"}"
+    VPN_USER="${VPN_USER%"${VPN_USER##*[![:space:]]}"}"
+    [ -n "$VPN_USER" ] || die "no username entered; aborted."
+    save_vpn_user_to_config
+    echo "Saved VPN_USER=$VPN_USER to $CONFIG_FILE"
+    echo
+  fi
   cmd_secret
   echo
   echo "Enter your University of Auckland password."
   echo "It is stored in your macOS Keychain (you'll get a system prompt to allow it)."
   read -rs -p "> " PASS; echo
+  # Trim stray whitespace: a pasted trailing space is a stored bad credential.
+  PASS="${PASS#"${PASS%%[![:space:]]*}"}"
+  PASS="${PASS%"${PASS##*[![:space:]]}"}"
   [ -z "$PASS" ] && die "no password entered; aborted."
   # Keychain errors go to our private state dir — this tool must not leave
   # files in /tmp (world-writable, wiped on reboot).
   ensure_state_dir
   local keyerr="$STATE_DIR/keychain-error.txt"
   if security add-generic-password -a "$VPN_USER" -s "$KEYCHAIN_SVC" -w "$PASS" -U 2>"$keyerr"; then
+    rm -f "$keyerr"
+    # Keychain now holds the CURRENT password; a leftover file from an earlier
+    # fallback would be ignored anyway (Keychain wins) — delete it so it can't
+    # resurface later.
+    rm -f "$PASSWORD_FILE"
     echo "Password saved to macOS Keychain."
   else
     echo "Keychain unavailable ($(head -n 1 "$keyerr" 2>/dev/null || true))."
     echo "Falling back to a protected file instead."
-    printf '%s\n' "$PASS" >"$PASSWORD_FILE"
-    chmod 600 "$PASSWORD_FILE"
+    write_secret_file "$PASSWORD_FILE" "$PASS"
     echo "Password saved to $PASSWORD_FILE (mode 600)."
+    # start prefers the Keychain entry when one exists, so a stale one would
+    # silently override this fresh password. Warn with the exact fix.
+    if security find-generic-password -a "$VPN_USER" -s "$KEYCHAIN_SVC" >/dev/null 2>&1; then
+      echo "WARNING: an older Keychain entry still exists and will be PREFERRED over this file."
+      echo "Remove it with: security delete-generic-password -a '$VPN_USER' -s '$KEYCHAIN_SVC'"
+    fi
   fi
   echo
   echo "Optional: let 'auckland-vpn start' run without typing your Mac password."
@@ -551,6 +736,11 @@ cmd_setup() {
 }
 
 cmd_start() {
+  # Gates first, in the right order: who are you, is everything installed —
+  # all BEFORE any sudo interaction (a missing binary must never masquerade
+  # as a sudo problem).
+  require_vpn_user
+  require_prereqs
   [ -s "$SECRET_FILE" ] || die "TOTP secret missing. Run: auckland-vpn setup"
   # Password: try Keychain first, then the protected-file fallback.
   # (The "|| true" lets the Keychain lookup "fail" without tripping set -e.)
@@ -559,7 +749,6 @@ cmd_start() {
     PASS="$(cat "$PASSWORD_FILE")"
   fi
   [ -z "$PASS" ] && die "VPN password not found (Keychain or $PASSWORD_FILE). Run: auckland-vpn setup"
-  [ -x "$SCRIPT_PATH" ] || die "vpnc-script not found at $SCRIPT_PATH"
   if [ ! -x "$HELPER_BIN" ]; then
     print_sudoers_hint
     exit 1
@@ -633,15 +822,22 @@ cmd_stop() {
 # -f' run via sudo sees the pattern inside sudo's argv, killed its own parent,
 # and made 'stop' die with a false "could not stop openconnect".
 stop_legacy_fallback() {
-  local pat="[o]penconnect.*$VPN_HOST"
+  local pat="[o]penconnect.*$VPN_HOST" waited=0
   if pgrep -f "$pat" >/dev/null 2>&1; then
     echo "Warning: helper unavailable; killing openconnect by pattern." >&2
     echo "         Run 'auckland-vpn setup-sudo' for the safe per-PID stop." >&2
-    if sudo pkill -f "$pat"; then
-      echo "Disconnecting..."
-    else
-      die "could not stop openconnect."
-    fi
+    sudo pkill -f "$pat" || die "could not stop openconnect."
+    # pkill only SIGNALS; confirm the process is really gone before claiming
+    # success (bounded ~5 s).
+    while pgrep -f "$pat" >/dev/null 2>&1; do
+      if [ "$waited" -ge 10 ]; then
+        echo "Warning: openconnect still running after ~5s — check: pgrep -fl openconnect" >&2
+        return 1
+      fi
+      sleep 0.5
+      waited=$((waited + 1))
+    done
+    echo "Disconnected."
   else
     echo "Not connected."
   fi
@@ -657,10 +853,103 @@ cmd_restart() {
 }
 
 cmd_pin() {
-  echo | openssl s_client -connect "$VPN_HOST:443" -servername "$VPN_HOST" 2>/dev/null \
-    | awk '/-----BEGIN CERTIFICATE-----/{f=1} f{print} /-----END CERTIFICATE-----/{exit}' \
-    | openssl x509 -noout -fingerprint -sha256 2>/dev/null \
-    | sed 's/.*Fingerprint=//' | tr -d ':' | awk '{print "sha256:"$1}'
+  command -v openssl >/dev/null 2>&1 \
+    || die "openssl not found (macOS ships it at /usr/bin/openssl)."
+  local fp
+  # pipefail + an explicit emptiness check: a failed fetch must say WHY it is
+  # failing instead of exiting silently via a swallowed pipeline status.
+  fp="$(echo | openssl s_client -connect "$VPN_HOST:443" -servername "$VPN_HOST" 2>/dev/null \
+        | awk '/-----BEGIN CERTIFICATE-----/{f=1} f{print} /-----END CERTIFICATE-----/{exit}' \
+        | openssl x509 -noout -fingerprint -sha256 2>/dev/null \
+        | sed 's/.*Fingerprint=//' | tr -d ':' | awk '{print "sha256:"$1}')" \
+    || die "could not fetch certificate for $VPN_HOST (network/DNS up?)"
+  [ -n "$fp" ] || die "could not fetch certificate for $VPN_HOST (network/DNS up?)"
+  printf '%s\n' "$fp"
+}
+
+# One command that names everything broken, with the exact fix for each.
+# Prints one line per check — "OK <thing>" or "FIX <thing> — <exact
+# command>" — and exits non-zero when anything needs fixing. Read-only except
+# for a throwaway write test in the state dir; never prompts for sudo.
+cmd_doctor() {
+  local fixes=0 last_err
+  if [ -n "$VPN_USER" ]; then
+    echo "OK   username set (VPN_USER=$VPN_USER)"
+  else
+    echo "FIX  username not set — run: auckland-vpn setup   (or: export VPN_USER=yourname)"
+    fixes=$((fixes + 1))
+  fi
+
+  if [ -n "$OPENCONNECT_BIN" ] && [ -x "$OPENCONNECT_BIN" ]; then
+    echo "OK   openconnect found at $OPENCONNECT_BIN"
+  else
+    echo "FIX  openconnect not found — install with: brew install openconnect"
+    fixes=$((fixes + 1))
+  fi
+
+  if [ -n "$SCRIPT_PATH" ] && [ -x "$SCRIPT_PATH" ]; then
+    echo "OK   vpnc-script found at $SCRIPT_PATH"
+  else
+    echo "FIX  vpnc-script missing — reinstall with: brew install openconnect (it provides etc/vpnc/vpnc-script)"
+    fixes=$((fixes + 1))
+  fi
+
+  if [ -s "$SECRET_FILE" ]; then
+    echo "OK   TOTP secret present at $SECRET_FILE"
+  else
+    echo "FIX  TOTP secret missing or empty — run: auckland-vpn setup"
+    fixes=$((fixes + 1))
+  fi
+
+  if [ -n "$VPN_USER" ] \
+      && security find-generic-password -a "$VPN_USER" -s "$KEYCHAIN_SVC" >/dev/null 2>&1; then
+    echo "OK   VPN password in macOS Keychain (service $KEYCHAIN_SVC)"
+  elif [ -s "$PASSWORD_FILE" ]; then
+    echo "OK   VPN password file present at $PASSWORD_FILE"
+  else
+    echo "FIX  VPN password not found (Keychain or $PASSWORD_FILE) — run: auckland-vpn setup"
+    fixes=$((fixes + 1))
+  fi
+
+  if [ ! -x "$HELPER_BIN" ]; then
+    echo "FIX  privileged helper missing — 'start' will ask for your Mac password once. Install with: auckland-vpn setup-sudo"
+    fixes=$((fixes + 1))
+  elif sudo -n -l "$HELPER_BIN" >/dev/null 2>&1; then
+    # -l <cmd> exits 0 only when sudoers policy actually allows this exact
+    # binary — a cached sudo timestamp or generic admin rights don't fool it
+    # the way 'sudo -n true' would.
+    echo "OK   helper installed ($HELPER_BIN) and passwordless sudo allows it"
+  else
+    echo "FIX  helper installed but sudoers does not allow it — re-run: auckland-vpn setup-sudo"
+    fixes=$((fixes + 1))
+  fi
+
+  if mkdir -p "$STATE_DIR" 2>/dev/null && chmod 700 "$STATE_DIR" 2>/dev/null \
+      && touch "$STATE_DIR/.doctor-write-test" 2>/dev/null; then
+    rm -f "$STATE_DIR/.doctor-write-test"
+    echo "OK   state dir writable at $STATE_DIR"
+  else
+    echo "FIX  cannot write to $STATE_DIR — fix with: mkdir -p '$STATE_DIR' && chmod 700 '$STATE_DIR'"
+    fixes=$((fixes + 1))
+  fi
+
+  if [ -f "$LOG_FILE" ]; then
+    last_err="$(last_log_error || true)"
+    if [ -n "$last_err" ]; then
+      echo "INFO last error in log: $last_err"
+      echo "     full log: auckland-vpn log"
+    else
+      echo "OK   no errors in current log"
+    fi
+  else
+    echo "INFO no log yet ($LOG_FILE) — nothing has connected from this account."
+  fi
+
+  if [ "$fixes" -gt 0 ]; then
+    echo "$fixes check(s) need fixing (see FIX lines above)."
+    return 1
+  fi
+  echo "All checks passed."
 }
 
 usage() {
@@ -676,19 +965,25 @@ auckland-vpn — reliable University of Auckland VPN (FortiNet + TOTP 2FA)
   status      Connected as ... (pid, IP) / Connecting... / Not connected.
   log         last 50 log lines ('log -f' follows until Ctrl-C)
   pin         print the current server certificate fingerprint
+  doctor      check every prerequisite; prints OK/FIX + exact fix per item
 
 Examples:
   auckland-vpn setup
   auckland-vpn start
   auckland-vpn status
   auckland-vpn stop
+
+Running 'auckland-vpn' with no arguments (or an unknown one) shows this help
+and exits 2 — it never touches the network.
 EOF
 }
 
 # ---- Dispatch ---------------------------------------------------------------
 # Sourcing this file (tests) defines functions without dispatching.
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
-  case "${1:-start}" in
+  # Explicit subcommand required: bare invocation or an unknown word shows
+  # usage and exits 2 — never an implicit (network-mutating) start.
+  case "${1:-}" in
     setup)       cmd_setup ;;
     setup-sudo)  cmd_setup_sudo ;;
     start)       cmd_start ;;
@@ -697,7 +992,8 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     status)      cmd_status ;;
     log)         shift; cmd_log "$@" ;;
     pin)         cmd_pin ;;
+    doctor)      cmd_doctor ;;
     -h|--help|help) usage ;;
-    *) echo "Unknown command: $1"; usage; exit 1 ;;
+    *) usage; exit 2 ;;
   esac
 fi

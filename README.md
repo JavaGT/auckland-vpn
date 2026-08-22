@@ -32,6 +32,11 @@ before running `auckland-vpn setup` / `start`:
 - **a private file** `~/.config/auckland-vpn/config` containing a line
   `VPN_USER=yourusername` (that file is yours and is not part of this repo).
 
+The config file is **parsed, not executed**: only blank lines, `#comments`,
+and `VPN_USER=<username>` lines are accepted — anything else is rejected with
+an error naming the file and line. (`setup` will offer to write the username
+there for you if it isn't set yet.)
+
 ## One-time setup
 
 1. **Install the script** (no sudo needed — `/opt/homebrew/bin` is on your PATH):
@@ -75,7 +80,11 @@ auckland-vpn status     # Connected as you (pid, tunnel IP) / Connecting... /
 auckland-vpn log        # last 50 log lines ('auckland-vpn log -f' follows)
 auckland-vpn stop       # disconnect
 auckland-vpn restart    # stop, confirm the old process is gone, start again
+auckland-vpn doctor     # check every prerequisite; OK/FIX + exact fix each
 ```
+
+Running bare `auckland-vpn` (or an unknown command) shows help and exits 2 —
+it never touches the network implicitly.
 
 ## Certificates
 

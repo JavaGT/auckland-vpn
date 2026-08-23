@@ -386,9 +386,12 @@ generate_helper() {
   printf '%s\n' '# Root-side writes happen ONLY under HELPER_DIR and LOG_DIR (both root-'
   printf '%s\n' '# owned directories installed by setup-sudo): the log is pre-created'
   printf '%s\n' '# owned by CALLER_UID:CALLER_GID mode 600 and appended via fd 3 — never'
-  printf '%s\n' '# chowned/recreated at runtime; the pidfile is root-owned 644; the TOTP'
-  printf '%s\n' '# token file is a root-owned mktemp removed by the EXIT trap. The helper'
-  printf '%s\n' '# opens no user-owned path: credentials arrive on stdin as two records.'
+  printf '%s\n' '# chowned/recreated at runtime; the pidfile is PRE-CREATED root-owned'
+  printf '%s\n' '# 644 by setup-sudo and KEPT across stops (openconnect truncates an'
+  printf '%s\n' '# existing --pid-file; readers tolerate it empty/stale); the TOTP token'
+  printf '%s\n' '# file is a root-owned mktemp (mode 600 via umask) removed by the EXIT'
+  printf '%s\n' '# trap. The helper opens no user-owned path: credentials arrive on'
+  printf '%s\n' '# stdin as two records.'
   # Baked values (%q makes each safe as a literal shell assignment).
   printf 'OC=%q\n' "$OPENCONNECT_BIN"
   printf 'VPNC_SCRIPT=%q\n' "$STAGED_VPNC_SCRIPT"
@@ -399,8 +402,8 @@ generate_helper() {
   printf 'PID_FILE=%q\n' "$PID_FILE"
   printf 'OP_LOCK=%q\n' "$HELPER_DIR/operation.lock"
   printf 'TOKEN_DIR=%q\n' "$HELPER_DIR"
-  printf 'CALLER_UID=%q\n' "$(id -u)"
-  printf 'CALLER_GID=%q\n' "$(id -g)"
+  printf 'CALLER_UID=%q\n' "$(/usr/bin/id -u)"
+  printf 'CALLER_GID=%q\n' "$(/usr/bin/id -g)"
   printf 'OC_HAS_PID_FILE=%q\n' "$pid_support"
   cat <<'BODY'
 set -euo pipefail
@@ -418,17 +421,26 @@ umask 077
 TOKEN_FILE=""
 LOCK_HELD=""
 
-# Remove our temp token file and our operation lock. The lock dir carries
-# our PID so we only ever remove a lock we acquired ourselves.
+# Remove our temp token file and our operation lock. Runs ONLY via the EXIT
+# trap: signals map to conventional exit codes (see traps below) whose EXIT
+# handling still releases the lock/token. Trapping cleanup directly on
+# HUP/INT/TERM made the handler RETURN and RESUME a half-torn-down
+# privileged run. The lock dir carries our PID so we only ever remove a
+# lock we acquired ourselves; marker-file + rmdir (never rm -rf) so any
+# unexpected extra contents become a loud failure, not swallowed debris.
 cleanup() {
   if [ -n "$TOKEN_FILE" ]; then /bin/rm -f "$TOKEN_FILE"; fi
   if [ -n "$LOCK_HELD" ] \
       && [ "$(/bin/cat "$OP_LOCK/pid" 2>/dev/null || true)" = "$$" ]; then
-    /bin/rm -rf "$OP_LOCK"
+    /bin/rm -f "$OP_LOCK/pid"
+    /bin/rmdir "$OP_LOCK" 2>/dev/null || true
   fi
   return 0
 }
-trap cleanup EXIT HUP INT TERM
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 die() { echo "auckland-vpn helper: error: $*" >&2; exit 1; }
 
@@ -438,26 +450,43 @@ usage() {
 }
 
 # Atomic root-side operation lock: only ONE start OR stop runs at a time.
-# mkdir(2) is atomic; a leftover dir whose recorded PID is dead is stale
-# debris from a killed helper and is taken over. Otherwise refuse loudly —
-# the wrapper's already-running guard stays as the fast-path UX only.
+# /bin/mkdir is atomic. A leftover dir is stale debris from a killed helper —
+# but only ever removed PROVABLY so: an empty/unreadable marker may belong to
+# a starter still inside its mkdir→write-pid window, so deleting it on sight
+# would steal a LIVE lock; we retry ~10 × 0.2s expecting the owner to record
+# its PID. Removal happens (a) when the marker names a holder ps cannot find,
+# or (b) after that grace window with the marker STILL empty — and then by
+# clearing the marker file and rmdir(2), never rm -rf, so a directory that
+# grew unexpected contents fails loudly instead of being swallowed. Every
+# decision is logged to stderr.
 acquire_lock() {
   local holder tries=0
-  until mkdir "$OP_LOCK" 2>/dev/null; do
+  until /bin/mkdir "$OP_LOCK" 2>/dev/null; do
+    tries=$((tries + 1))
+    [ "$tries" -le 40 ] || die "cannot acquire operation lock at $OP_LOCK (stale or corrupt). Remove it manually as root:  sudo /bin/rmdir '$OP_LOCK'"
     holder="$(/bin/cat "$OP_LOCK/pid" 2>/dev/null || true)"
     case "$holder" in
       ''|*[!0-9]*)
-        /bin/rm -rf "$OP_LOCK"                 # unreadable marker: stale
+        if [ "$tries" -le 10 ]; then
+          echo "auckland-vpn helper: lock marker at $OP_LOCK is empty (attempt $tries/10) — waiting for its owner to record its PID." >&2
+          /bin/sleep 0.2
+          continue
+        fi
+        echo "auckland-vpn helper: lock marker still empty after grace — treating the lock as abandoned and taking over." >&2
         ;;
       *)
         if kill -0 "$holder" 2>/dev/null; then
           die "another start/stop operation is in progress (pid $holder); try again shortly."
         fi
-        /bin/rm -rf "$OP_LOCK"                 # recorded PID is dead: stale
+        echo "auckland-vpn helper: recorded lock holder (pid $holder) is dead — taking over the stale lock." >&2
         ;;
     esac
-    tries=$((tries + 1))
-    [ "$tries" -lt 5 ] || die "cannot acquire operation lock at $OP_LOCK."
+    # Only a proven-dead holder or an empty-after-grace marker reaches this.
+    # rm the single known marker file, then rmdir: if anything unexpected
+    # appeared inside, rmdir refuses and the bound above ends in the loud,
+    # actionable die() instead of a recursive delete.
+    /bin/rm -f "$OP_LOCK/pid"
+    /bin/rmdir "$OP_LOCK" 2>/dev/null || true
   done
   printf '%s\n' "$$" >"$OP_LOCK/pid"
   LOCK_HELD=1
@@ -497,6 +526,26 @@ path_is_trusted() {
   done
 }
 
+# Shared pidfile gate used by BOTH helper start and stop: it must exist, be
+# a regular non-symlink file, and be owned by root — or by the pinned
+# invoking user (CALLER_UID), which keeps this validator exercisable in
+# unprivileged sandboxes; production keeps the file root-owned inside the
+# root-owned HELPER_DIR, so no third party can plant one either way.
+# Anything else is refused loudly and never touched blindly by root.
+validate_pid_file() {
+  local owner
+  if [ ! -e "$PID_FILE" ] && [ ! -L "$PID_FILE" ]; then
+    die "no pidfile at $PID_FILE (setup-sudo pre-creates it) — was the VPN started by the helper?"
+  fi
+  if [ -L "$PID_FILE" ] || [ ! -f "$PID_FILE" ]; then
+    die "$PID_FILE exists but is not a regular root-owned file; remove it manually as root, then retry."
+  fi
+  owner="$(/usr/bin/stat -f '%u' "$PID_FILE")" || die "cannot read the owner of $PID_FILE"
+  if [ "$owner" != "0" ] && [ "$owner" != "$CALLER_UID" ]; then
+    die "$PID_FILE is owned by uid $owner, not root; remove it manually as root, then retry."
+  fi
+}
+
 cmd_start() {
   acquire_lock
 
@@ -514,25 +563,23 @@ cmd_start() {
   fi
   exec 3>>"$LOG_FILE"
 
-  # A pre-existing pidfile must be regular AND root-owned before anything
-  # touches it again (blocks a planted symlink/file redirecting the
-  # --pid-file write); anything else is refused, not touched blind by root.
-  # A valid-but-stale pidfile is removed: we hold the operation lock and are
-  # about to start fresh — leaving it would make the wait below read the OLD
-  # pid and report success prematurely. (setup-sudo also clears relics.)
-  if [ -e "$PID_FILE" ] || [ -L "$PID_FILE" ]; then
-    if [ ! -f "$PID_FILE" ] || [ -L "$PID_FILE" ] \
-        || [ "$(/usr/bin/stat -f '%u' "$PID_FILE")" != "0" ]; then
-      die "$PID_FILE exists but is not a regular root-owned file; remove it manually as root, then retry."
-    fi
-    /bin/rm -f "$PID_FILE"
-  fi
+  # The pidfile is PRE-CREATED root-owned mode 644 by setup-sudo and KEPT
+  # across stops: openconnect truncates an existing --pid-file, and the
+  # unprivileged wrapper only ever READS it (empty/stale records between
+  # runs are normal; readers fall back gracefully). Root never chowns or
+  # chmods it at runtime — the installer fixed owner and mode. A symlink or
+  # foreign-owned file is refused above, never touched.
+  validate_pid_file
+  # Truncate so the wait below can only observe THIS attempt's pid: a
+  # leftover record from a previous run must not read as fresh success.
+  : >"$PID_FILE"
 
   # Credentials arrive on stdin as TWO newline-terminated records: VPN
   # password, then TOTP secret. Newline framing is safe because 'setup'
-  # strips ALL whitespace from stored secrets (and passwords come from the
-  # Keychain prompt / protected file without raw newlines). Root reads NO
-  # user-owned path — the wrapper reads the secret itself.
+  # strips ALL whitespace from stored secrets, the wrapper strips the TOTP
+  # secret again, and the wrapper REJECTS any stored password containing a
+  # newline before piping anything. Root reads NO user-owned path — the
+  # wrapper reads the secret itself.
   local pass="" token=""
   IFS= read -r pass || true
   [ -n "$pass" ] || die "no VPN password received on stdin"
@@ -540,11 +587,11 @@ cmd_start() {
   [ -n "$token" ] || die "no TOTP secret received on stdin"
 
   # --token-secret=@file needs a real path: park the secret in a root-owned
-  # mktemp INSIDE HELPER_DIR, mode 600, removed by the cleanup trap
-  # (openconnect unlinks @files after reading; the trap covers failures).
+  # mktemp INSIDE HELPER_DIR, removed by the cleanup trap (openconnect
+  # unlinks @files after reading; the trap covers failures). umask 077 plus
+  # mktemp already yield mode 600 — no runtime chmod needed.
   TOKEN_FILE="$(/usr/bin/mktemp "$TOKEN_DIR/token.XXXXXX")" \
     || die "cannot create token temp file in $TOKEN_DIR"
-  /bin/chmod 600 "$TOKEN_FILE"
   printf '%s\n' "$token" >"$TOKEN_FILE"
 
   # Append the dated banner via the open fd. The log is append-only with
@@ -556,8 +603,9 @@ cmd_start() {
   # Fixed arguments only — nothing here comes from the invoking user.
   # openconnect backgrounds itself after connecting (--background) and writes
   # the daemon PID to $PID_FILE (--pid-file), which 'stop' uses instead of
-  # pattern-killing processes. umask 022 so the pidfile lands world-readable;
-  # it is forced to 644 below anyway. Launched via env -i: explicit env only.
+  # pattern-killing processes. umask 022 so a freshly created pidfile would
+  # be world-readable (setup-sudo normally pre-creates it mode 644; this
+  # covers a first creation too). Launched via env -i: explicit env only.
   umask 022
   if ! printf '%s\n' "$pass" | /usr/bin/env -i \
       PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME=/var/root USER=root LOGNAME=root LANG=C \
@@ -583,25 +631,36 @@ cmd_start() {
     waited=$((waited + 1))
   done
   # PID not secret; the unprivileged wrapper reads it for status/guards.
-  # Keep it root-owned (the root-owned HELPER_DIR prevents tampering) but
-  # world-readable. When run as root this is exact; best-effort otherwise.
-  /usr/sbin/chown 0:wheel "$PID_FILE" 2>/dev/null || true
-  /bin/chmod 644 "$PID_FILE"
+  # Owner and mode were fixed at install time (root:wheel 644) and openconnect
+  # only truncates/writes the existing file — nothing to normalize here, and
+  # root never chowns/chmods at runtime.
   echo "VPN started (pid $(/bin/cat "$PID_FILE")). Log: $LOG_FILE"
 }
 
 cmd_stop() {
   acquire_lock
-  [ -s "$PID_FILE" ] || die "no pidfile at $PID_FILE — was the VPN started by the helper?"
+  validate_pid_file
   local pid lstart now waited=0 cmdline
   pid="$(/bin/cat "$PID_FILE")"
-  case "$pid" in ''|*[!0-9]*) die "corrupt pidfile $PID_FILE" ;; esac
+  case "$pid" in
+    '')
+      # The pidfile persists across stops; an empty record just means no VPN
+      # is running (e.g. after a failed start). Nothing to do — no sudo-side
+      # drama, nothing removed.
+      echo "No VPN is recorded as running (pidfile is empty); nothing to stop."
+      return 0
+      ;;
+    *[!0-9]*) die "corrupt pidfile $PID_FILE" ;;
+  esac
 
   # Kill the recorded PID only if it still belongs to OUR openconnect
-  # (guards against PID reuse). Never pattern-kill other processes.
+  # (guards against PID reuse). Never pattern-kill other processes. A record
+  # naming anything else is a stale leftover from a finished run: say so and
+  # stop cleanly — the pidfile is kept, the next start truncates it.
   cmdline="$(/bin/ps -p "$pid" -o command= 2>/dev/null || true)"
   if [[ "$cmdline" != *openconnect* || "$cmdline" != *"$SERVER"* ]]; then
-    die "pid $pid is no longer our openconnect ('$cmdline'); remove $PID_FILE manually."
+    echo "Not connected (recorded pid $pid is no longer our openconnect)."
+    return 0
   fi
   # Pin the process identity across the WHOLE wait with its start time:
   # if the PID vanishes (reaped) or is REUSED mid-wait (lstart changes),
@@ -614,14 +673,22 @@ cmd_stop() {
     if [ -z "$now" ] || [ "$now" != "$lstart" ]; then
       break                                    # gone, or reused: stop waiting
     fi
-    if [ "$waited" -ge 20 ]; then              # ~10s, then escalate
-      kill -9 "$pid" 2>/dev/null || true
-      break
+    if [ "$waited" -ge 20 ]; then              # ~10s
+      # No SIGKILL escalation: on a recycled PID it would kill an innocent
+      # process. Report honestly, remove nothing, fail loudly.
+      echo "Warning: openconnect (pid $pid) did not exit within ~10s of SIGTERM." >&2
+      echo "It was deliberately NOT force-killed (SIGKILL could land on a recycled PID)." >&2
+      echo "Inspect it manually:  /bin/ps -p $pid -o lstart=,command=" >&2
+      echo "If the machine has rebooted since, or the process is really gone," >&2
+      echo "this stale record is harmless — the next start reuses the pidfile." >&2
+      exit 1
     fi
     /bin/sleep 0.5
     waited=$((waited + 1))
   done
-  /bin/rm -f "$PID_FILE"
+  # The pidfile is persistent infrastructure (root-owned 644): keep it with
+  # its now-dead PID. Readers tolerate stale records; the next start
+  # truncates it before launching a fresh daemon.
   echo "Disconnected."
 }
 
@@ -688,11 +755,75 @@ print_sudoers_hint() {
   return 0
 }
 
+# Emit the STATIC privileged installer. NOTHING is interpolated into the
+# emitted text: every site value arrives as a positional parameter, so
+# apostrophes or spaces in any path can no longer silently break an
+# installed command. Layout:
+#   $1 caller UID   $2 caller GID
+#   $3 HELPER_DIR   $4 LOG_DIR    $5 LOG_FILE
+#   $6 vpnc-script source   $7 staged vpnc-script destination
+#   $8 PID_FILE     $9 HELPER_BIN ${10} SUDOERS_FILE
+#   ${11} helper source     ${12} sudoers fragment source
+generate_installer() {
+  cat <<'INSTALLER'
+#!/bin/sh
+set -eu
+# Privileged install step for auckland-vpn, run as:
+#   sudo sh install.sh <12 positional parameters, see generator>
+# All site values arrive as arguments; uid/gid are re-validated numerically
+# before any use.
+CALLER_UID="$1"; CALLER_GID="$2"
+HELPER_DIR="$3"; LOG_DIR="$4"; LOG_FILE="$5"
+VPNC_SRC="$6";  VPNC_DST="$7"
+PID_FILE="$8";  HELPER_BIN="$9"; SUDOERS_FILE="${10}"
+HELPER_SRC="${11}"; SUDOERS_SRC="${12}"
+
+case "$CALLER_UID$CALLER_GID" in
+  ''|*[!0-9]*) echo "install.sh: caller uid/gid must be numeric" >&2; exit 1 ;;
+esac
+
+# Root-owned directories first; everything below lands inside them.
+install -d -o root -g wheel -m 755 "$HELPER_DIR"
+install -d -o root -g wheel -m 755 "$LOG_DIR"
+
+# Log: pre-created owned by the invoking user mode 600 inside the ROOT-owned
+# log dir; re-running heals owner/mode of an existing log. The helper only
+# ever appends to it — never chowns or recreates it at runtime.
+if [ ! -f "$LOG_FILE" ] || [ -L "$LOG_FILE" ]; then
+  rm -f "$LOG_FILE"
+  install -m 600 -o "$CALLER_UID" -g "$CALLER_GID" /dev/null "$LOG_FILE"
+fi
+chown "$CALLER_UID:$CALLER_GID" "$LOG_FILE"
+chmod 600 "$LOG_FILE"
+
+# Stage the vpnc-script copy the helper will actually run.
+install -o root -g wheel -m 755 "$VPNC_SRC" "$VPNC_DST"
+
+# Pidfile: PRE-CREATED root-owned mode 644 and KEPT across stops — openconnect
+# truncates an existing --pid-file, and the unprivileged wrapper only reads
+# it. Heal a planted symlink/non-regular file first; install() then fixes
+# owner/mode no matter what regular file was there before.
+if [ -L "$PID_FILE" ] || { [ -e "$PID_FILE" ] && [ ! -f "$PID_FILE" ]; }; then
+  rm -f "$PID_FILE"
+fi
+install -o root -g wheel -m 644 /dev/null "$PID_FILE"
+rm -f "$HELPER_DIR/vpn.pid.prev"
+
+install -o root -g wheel -m 755 "$HELPER_SRC" "$HELPER_BIN"
+
+rm -f "$SUDOERS_FILE"
+install -o root -g wheel -m 440 "$SUDOERS_SRC" "$SUDOERS_FILE"
+
+echo '--- legacy-rule scan (reporting only; nothing auto-removed from /etc/sudoers) ---'
+grep -Hn 'openconnect\|pkill' /etc/sudoers /etc/sudoers.d/* 2>/dev/null | grep NOPASSWD || true
+INSTALLER
+}
+
 # Canonical privileged setup: generates helper + sudoers fragment into a temp
 # dir, validates the sudoers syntax with visudo -cf, then installs BOTH in a
 # single sudo interaction. Never appends to /etc/sudoers.
 cmd_setup_sudo() {
-  [ "$(id -u)" -ne 0 ] || die "run this as your normal user; it will ask for your Mac password once."
+  [ "$(/usr/bin/id -u)" -ne 0 ] || die "run this as your normal user; it will ask for your Mac password once."
   # Prereqs and username BEFORE anything else: the generated helper bakes the
   # resolved binary paths and VPN_USER in at this moment, and no sudo prompt
   # should happen while something as basic as openconnect is still missing.
@@ -700,7 +831,15 @@ cmd_setup_sudo() {
   require_vpn_user
   openconnect_supports_pid_file \
     || die "$OPENCONNECT_BIN lacks --pid-file (needed for safe stop). Run: brew upgrade openconnect"
-  ensure_state_dir
+
+  # Resolve uid/gid ONCE, by absolute path, and validate them BEFORE they are
+  # used anywhere (they are passed as installer arguments and baked into the
+  # generated helper).
+  local caller_uid caller_gid
+  caller_uid="$(/usr/bin/id -u)" || die "cannot determine your uid."
+  caller_gid="$(/usr/bin/id -g)" || die "cannot determine your gid."
+  case "$caller_uid" in ''|*[!0-9]*) die "unexpected uid: $caller_uid" ;; esac
+  case "$caller_gid" in ''|*[!0-9]*) die "unexpected gid: $caller_gid" ;; esac
 
   # Stage in the PRIVATE state dir, never /tmp: setup-sudo must not create
   # files (even transient ones) in a world-writable, shared directory.
@@ -720,35 +859,19 @@ cmd_setup_sudo() {
   visudo -cf "$tmp/auckland-vpn" >/dev/null \
     || die "generated sudoers rule failed 'visudo -cf'; nothing was installed."
 
-  # Staged as a script so the privileged step needs no nested quoting.
-  # Every root-side write lands under HELPER_DIR or LOG_DIR (both created
-  # root-owned); the LOG FILE is pre-created owned by the invoking user
-  # mode 600 so the helper only ever appends to it — never chowns or
-  # recreates it at runtime. Re-running setup-sudo heals owner/mode of an
-  # existing log (root operating inside its OWN root-owned directory) and
-  # refreshes the staged vpnc-script copy from Homebrew.
-  {
-    echo '#!/bin/sh'
-    echo 'set -eu'
-    echo "install -d -o root -g wheel -m 755 '$HELPER_DIR'"
-    echo "install -d -o root -g wheel -m 755 '$LOG_DIR'"
-    echo "if [ ! -f '$LOG_FILE' ] || [ -L '$LOG_FILE' ]; then"
-    echo "  rm -f '$LOG_FILE'"
-    echo "  install -m 600 -o $(id -u) -g $(id -g) /dev/null '$LOG_FILE'"
-    echo "fi"
-    echo "chown $(id -u):$(id -g) '$LOG_FILE'"
-    echo "chmod 600 '$LOG_FILE'"
-    echo "install -o root -g wheel -m 755 '$SCRIPT_PATH' '$STAGED_VPNC_SCRIPT'"
-    echo "rm -f '$PID_FILE' '$HELPER_DIR/vpn.pid.prev'"
-    echo "install -o root -g wheel -m 755 '$tmp/helper' '$HELPER_BIN'"
-    echo "rm -f '$SUDOERS_FILE'"
-    echo "install -o root -g wheel -m 440 '$tmp/auckland-vpn' '$SUDOERS_FILE'"
-    echo "echo '--- legacy-rule scan (reporting only; nothing auto-removed from /etc/sudoers) ---'"
-    echo "grep -Hn 'openconnect\\|pkill' /etc/sudoers /etc/sudoers.d/* 2>/dev/null | grep NOPASSWD || true"
-  } >"$tmp/install.sh"
+  # Static installer body + all values as positional parameters: nothing is
+  # interpolated into the emitted script, so apostrophes/spaces in any path
+  # are harmless (the old inline-quoted lines broke silently on them).
+  generate_installer >"$tmp/install.sh"
 
   echo "Installing root-owned helper + restricted sudoers rule (one sudo prompt)..."
-  sudo sh "$tmp/install.sh" || die "privileged install failed."
+  sudo sh "$tmp/install.sh" \
+    "$caller_uid" "$caller_gid" \
+    "$HELPER_DIR" "$LOG_DIR" "$LOG_FILE" \
+    "$SCRIPT_PATH" "$STAGED_VPNC_SCRIPT" \
+    "$PID_FILE" "$HELPER_BIN" "$SUDOERS_FILE" \
+    "$tmp/helper" "$tmp/auckland-vpn" \
+    || die "privileged install failed."
   trap - EXIT
   rm -rf "$tmp"
   echo "Done. Passwordless sudo is now limited to exactly:"
@@ -918,6 +1041,13 @@ cmd_start() {
     PASS="$(cat "$PASSWORD_FILE")"
   fi
   [ -z "$PASS" ] && die "VPN password not found (Keychain or $PASSWORD_FILE). Run: auckland-vpn setup"
+  # The helper frames credentials as TWO newline-terminated stdin records
+  # (password, then TOTP secret); a raw newline inside the password would
+  # corrupt that framing. Reject it here, before anything is piped. \r and
+  # spaces pass through unchanged.
+  case "$PASS" in
+    *$'\n'*) die "stored password contains a newline — re-run: auckland-vpn setup" ;;
+  esac
   if [ ! -x "$HELPER_BIN" ]; then
     print_sudoers_hint
     exit 1
@@ -974,11 +1104,13 @@ cmd_start() {
 }
 
 cmd_stop() {
-  # Nothing to stop (no live process, no pidfile): say so without bothering
-  # sudo — keeps 'restart' quiet when nothing was running.
+  # Nothing to stop (no live process, no non-empty pidfile): say so without
+  # bothering sudo — keeps 'restart' quiet when nothing was running. The
+  # pidfile persists across stops, so an EMPTY record is a normal "nothing
+  # running" state, not an error.
   local pid
   pid="$(running_vpn_pid || true)"
-  if [ -z "$pid" ] && [ ! -e "$PID_FILE" ]; then
+  if [ -z "$pid" ] && [ ! -s "$PID_FILE" ]; then
     echo "Not connected."
     return 0
   fi

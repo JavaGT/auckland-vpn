@@ -115,7 +115,16 @@ if you ever want to inspect it, but pinning is not used.
   from `~/.config/auckland-vpn/totp-secret` itself, and hands both to the
   privileged helper over its standard input — root-side code never opens
   a user-owned path. The pidfile stays at
-  `/private/etc/auckland-vpn/vpn.pid`, owned by root, mode 644.
+  `/private/etc/auckland-vpn/vpn.pid`, owned by root, mode 644. It is
+  pre-created by `setup-sudo` and kept across stops: between runs it may
+  be empty or hold a stopped attempt's PID — readers treat both as
+  "nothing running", and each start truncates it before launching.
+- **Password limitation:** a stored password must not contain a raw
+  newline character. `start` hands the password and the TOTP secret to
+  the privileged helper as two newline-framed records, so a newline
+  inside a password would corrupt the framing — it is rejected up front.
+  Spaces, `\r`, and every other character pass through unchanged. Re-run
+  `auckland-vpn setup` if you ever hit this message.
 - **`start` verifies the tunnel**: it polls for connected evidence for up to
   ~15 s ("verifying . . ."), prints `Connected as <user>. Tunnel IP: ...` on
   success, and on failure dumps the last 15 log lines inline before pointing

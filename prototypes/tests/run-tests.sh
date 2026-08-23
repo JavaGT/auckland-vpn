@@ -260,6 +260,9 @@ test_privileged_command_contract() {
   assert_contains "$helper" '[ $# -eq 1 ] || usage'
   assert_contains "$helper" 'start) cmd_start ;;'
   assert_contains "$helper" 'stop)  cmd_stop ;;'
+  # Audit P1 (issue #15): the fixed argv must fail loudly instead of waiting
+  # for input a stdin-less root process can never supply.
+  assert_contains "$helper" '--non-inter'
   assert_not_contains "$helper" 'pkill '
 
   cat >"$box/bin/visudo" <<'STUB'
@@ -300,9 +303,13 @@ test_start_success_with_stub_openconnect() {
   export PATH="$box/bin:$PATH"
   output="$(cmd_start 2>&1)" || fail "start unexpectedly failed: $output"
   assert_contains "$output" 'Tunnel IP: 10.20.30.40'
+  # Monitor intent (issue #14): a successful start marks the VPN wanted-up.
+  [ -f "$STATE_DIR/monitor.enabled" ] || fail 'start did not mark monitor intent (monitor.enabled)'
   args="$(cat "$box/bin/stub.argv")"
   assert_contains "$args" '--protocol=fortinet'
   assert_contains "$args" '--passwd-on-stdin'
+  # Audit P1 (issue #15): the launched process itself must carry --non-inter.
+  assert_contains "$args" '--non-inter'
   assert_contains "$args" "--pid-file=$PID_FILE"
   assert_contains "$args" 'connectvpn.auckland.ac.nz/client'
   [ "$(cat "$box/bin/stub.stdin")" = 'correct horse battery staple' ] \
@@ -330,6 +337,8 @@ test_start_success_with_stub_openconnect() {
   # and the next start truncates it.
   [ -s "$PID_FILE" ] || fail 'stop must keep the non-empty pidfile in place'
   [ "$(stat -f '%Lp' "$PID_FILE")" = '644' ] || fail 'stop changed the pidfile mode'
+  # ...and an explicit user stop clears the monitor's wanted-up intent.
+  [ ! -e "$STATE_DIR/monitor.enabled" ] || fail 'stop did not clear monitor intent'
   ! ps -p "$pid" >/dev/null 2>&1 || fail 'stop left the stub process running'
 }
 
@@ -606,6 +615,179 @@ test_stop_timeout_reports_honestly_without_sigkill() {
   kill -9 "$daemon_pid" 2>/dev/null || true
 }
 
+# ---- Monitor / auto-heal (issue #14) -----------------------------------------
+# Thresholds must be exported BEFORE source_cli: the wrapper freezes their
+# ${VAR:-default} values at source time (exactly like the prototype did).
+
+# Pure classifier matrix + hysteresis + backoff ladder + circuit breaker,
+# driven through the sourced functions (prototype test pattern reused).
+test_monitor_state_machine_transitions() {
+  local box now r delay i expected
+  box="$(new_sandbox monitor-machine)"
+  export RECONNECT_GRACE=90 NETWORK_SETTLE_GRACE=30 DEGRADED_THRESHOLD=2 \
+    DEGRADED_GRACE=120 MAX_RESTART_ATTEMPTS=7 CIRCUIT_COOLDOWN=3600 \
+    BACKOFF_CAP=900 AUCKLAND_VPN_DRY_RUN=1
+  source_cli "$box"
+  ensure_state_dir   # save_monitor_state writes below $STATE_DIR
+
+  # Classifier matrix (prototype contract).
+  [ "$(classify_state 1 1 1 1 1)" = healthy ]      || fail 'all-ok must classify healthy'
+  [ "$(classify_state 1 1 1 0 1)" = degraded ]     || fail 'direct-DNS failure must classify degraded'
+  [ "$(classify_state 1 1 1 1 0)" = degraded ]     || fail 'system-resolver failure must classify degraded'
+  [ "$(classify_state 1 0 0 1 1)" = reconnecting ] || fail 'missing tunnel/route must classify reconnecting'
+  [ "$(classify_state 0 1 1 1 1)" = dead ]         || fail 'invalid PID must classify dead'
+
+  # Degraded hysteresis: ONE consecutive failure waits; the SECOND crosses
+  # DEGRADED_THRESHOLD (and, with the grace window aged, becomes a restart).
+  # shellcheck disable=SC2034  # seeds for state_machine_step's globals
+  current_state=unknown bad_since=0 degraded_count=0 restart_attempts=0
+  # shellcheck disable=SC2034  # seeds for state_machine_step's globals
+  next_attempt=0 circuit_until=0 healthy_count=0
+  now="$(date +%s)"
+  # NOTE: captured via redirect, NOT command substitution — $( ) would run
+  # the step in a subshell and discard the counter mutations under test.
+  state_machine_step degraded "$now" >"$box/rec"
+  r="$(cat "$box/rec")"
+  assert_contains "$r" 'action=wait dns_failures=1'
+  now=$((now + DEGRADED_GRACE))   # age past the degraded dwell window
+  state_machine_step degraded "$now" >"$box/rec"
+  r="$(cat "$box/rec")"
+  assert_contains "$r" 'action=WOULD_RESTART'
+
+  # Backoff ladder 0,30,60,120,300,600 then the 900s cap (15 min); the NEXT
+  # due attempt after MAX_RESTART_ATTEMPTS opens the circuit instead.
+  # shellcheck disable=SC2034  # seeds for state_machine_step's globals
+  current_state=unknown degraded_count=0 restart_attempts=0
+  # shellcheck disable=SC2034  # seeds for state_machine_step's globals
+  next_attempt=0 circuit_until=0 healthy_count=0
+  bad_since=$((now - 10000))   # pre-age: settle/reconnect graces long elapsed
+  expected=(0 30 60 120 300 600 900)
+  for i in 1 2 3 4 5 6 7; do
+    now=$((now + 10000))
+    state_machine_step dead "$now" >"$box/rec"
+    r="$(cat "$box/rec")"
+    case "$r" in
+      *action=WOULD_RESTART*) ;;
+      *) fail "attempt $i did not request a restart: $r" ;;
+    esac
+    delay="${r##*next_delay=}"
+    [ "$delay" = "${expected[$((i - 1))]}" ] \
+      || fail "backoff for attempt $i: got '$delay', want '${expected[$((i - 1))]}"
+  done
+  now=$((now + 10000))
+  state_machine_step dead "$now" >"$box/rec"
+  r="$(cat "$box/rec")"
+  case "$r" in
+    *action=notify*retry_at=*) : ;;
+    *) fail "attempt beyond MAX_RESTART_ATTEMPTS must open the circuit: $r" ;;
+  esac
+  # The breaker state survives persistence (atomic file, validated fields).
+  save_monitor_state || fail 'save_monitor_state failed'
+  grep -q '^current_state=circuit_open$' "$MONITOR_STATE_FILE" \
+    || fail 'circuit state not persisted'
+  grep -Eq '^circuit_until=[0-9]+$' "$MONITOR_STATE_FILE" \
+    || fail 'circuit_until not persisted numerically'
+
+  # Corrupt state resets conservatively: defaults, no shell evaluation, and
+  # load REPORTS the corruption to its caller.
+  # shellcheck disable=SC2016  # literal '$(...)' is the attack payload here
+  printf 'current_state=circuit_open\nbad_since=$(touch /tmp/pwned)\n' >"$MONITOR_STATE_FILE"
+  if load_monitor_state; then fail 'corrupt state file was accepted'; fi
+  [ "$current_state" = unknown ] && [ "$bad_since" = 0 ] \
+    || fail 'corrupt state did not reset conservatively'
+  [ ! -e /tmp/pwned ] || { rm -f /tmp/pwned; fail 'state content was evaluated'; }
+}
+
+# End-to-end --once against sandbox fixtures: a dead tunnel with NO intent is
+# left alone (idle); with intent + DRY_RUN it logs the exact would-be commands
+# WITHOUT ever invoking sudo, and persists its counters atomically.
+test_monitor_once_dead_fixture_dry_run() {
+  local box out
+  box="$(new_sandbox monitor-once)"
+  export INTERVAL=20 RECONNECT_GRACE=0 NETWORK_SETTLE_GRACE=0 \
+    DEGRADED_THRESHOLD=2 DEGRADED_GRACE=0 MAX_RESTART_ATTEMPTS=5 \
+    AUCKLAND_VPN_DRY_RUN=1
+  source_cli "$box"
+  configure_generated_helper "$box"
+  # Sentinel sudo: ANY invocation records itself and fails — dry-run must
+  # never reach it.
+  cat >"$box/bin/sudo" <<STUB
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >"$box/SUDO_CALLED"
+exit 1
+STUB
+  chmod +x "$box/bin/sudo"
+  export PATH="$box/bin:$PATH"
+
+  # Fixture: pidfile exists but names nothing running -> observation=dead.
+  : >"$PID_FILE"
+
+  # No intent yet: the tunnel is NOT wanted up — observe, never heal.
+  out="$(cmd_monitor --once 2>&1)" || fail "monitor --once (idle) failed: $out"
+  assert_contains "$out" 'observation=dead'
+  assert_contains "$out" 'state=idle action=none reason=intent-down'
+  [ ! -e "$box/SUDO_CALLED" ] || fail 'idle pass invoked sudo'
+
+  # Mark wanted-up (as 'auckland-vpn start' does): now the dead tunnel is due
+  # for healing, which dry-run turns into logged would-be actions.
+  touch "$STATE_DIR/monitor.enabled"
+  out="$(cmd_monitor --once 2>&1)" || fail "monitor --once (heal) failed: $out"
+  assert_contains "$out" 'observation=dead'
+  assert_contains "$out" 'action=WOULD_RESTART'
+  assert_contains "$out" "[dry-run] would run: sudo -n $HELPER_BIN stop"
+  assert_contains "$out" "[dry-run] would run: sudo -n $HELPER_BIN start"
+  [ ! -e "$box/SUDO_CALLED" ] || fail 'dry-run attempted sudo'
+  # Counters persisted atomically: private mode, validated numeric content.
+  [ "$(stat -f '%Lp' "$MONITOR_STATE_FILE")" = '600' ] \
+    || fail "monitor-state not mode 600: $(stat -f '%Lp' "$MONITOR_STATE_FILE")"
+  grep -q '^restart_attempts=1$' "$MONITOR_STATE_FILE" \
+    || fail "restart attempt counter not persisted: $(cat "$MONITOR_STATE_FILE")"
+}
+
+# doctor gains informational monitor lines: running? and last recorded state?
+test_doctor_reports_monitor_status() {
+  local box out
+  box="$(new_sandbox monitor-doctor)"
+  source_cli "$box"
+  configure_generated_helper "$box"
+  out="$(cmd_doctor 2>&1 || true)"
+  assert_contains "$out" 'INFO monitor not running'
+  assert_contains "$out" 'INFO no monitor state recorded yet'
+  printf 'current_state=degraded\nbad_since=0\ndegraded_count=1\nrestart_attempts=0\nnext_attempt=0\ncircuit_until=0\nhealthy_count=0\n' \
+    >"$STATE_DIR/monitor-state"
+  chmod 600 "$STATE_DIR/monitor-state"
+  out="$(cmd_doctor 2>&1 || true)"
+  assert_contains "$out" 'INFO monitor last recorded state: degraded'
+}
+
+# diagnose (issue #15) classifies failure classes from sandbox log fixtures.
+test_diagnose_failure_classes() {
+  local box out status
+  box="$(new_sandbox diagnose)"
+  source_cli "$box"
+  LOG_FILE="$box/vpn.log"
+
+  # No log at all: diagnose says so and exits non-zero (nothing to analyse).
+  out="$(cmd_diagnose 2>&1)"
+  status=$?
+  [ "$status" -ne 0 ] || fail 'diagnose without any log should exit non-zero'
+  assert_contains "$out" 'No log file yet'
+
+  printf '==== auckland-vpn start now ====\nInvalid credentials; try again.\n' >"$LOG_FILE"
+  out="$(cmd_diagnose 2>&1)"
+  assert_contains "$out" 'Refresh BOTH together'
+  assert_contains "$out" 'REALM:     WARNING'
+
+  printf "%s\nGot login realm 'client'\nConnected as 10.1.2.3\n%s\n%s\n" \
+    '==== auckland-vpn start later ====' \
+    'WARNING: Got split-DNS domains (not yet implemented)' \
+    'Established DTLS connection (v1)' >"$LOG_FILE"
+  out="$(cmd_diagnose 2>&1)"
+  assert_contains "$out" "ok — \"Got login realm 'client'\" present"
+  assert_contains "$out" 'does NOT implement'
+  assert_contains "$out" 'TRANSPORT: DTLS established.'
+}
+
 run_test() {
   local name="$1"
   if ( "$name" ); then
@@ -633,6 +815,10 @@ tests=(
   test_stale_lock_takeover
   test_installer_takes_paths_as_parameters
   test_stop_timeout_reports_honestly_without_sigkill
+  test_monitor_state_machine_transitions
+  test_monitor_once_dead_fixture_dry_run
+  test_doctor_reports_monitor_status
+  test_diagnose_failure_classes
 )
 
 for test_name in "${tests[@]}"; do run_test "$test_name"; done

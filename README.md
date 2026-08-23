@@ -81,6 +81,9 @@ auckland-vpn log        # last 50 log lines ('auckland-vpn log -f' follows)
 auckland-vpn stop       # disconnect
 auckland-vpn restart    # stop, confirm the old process is gone, start again
 auckland-vpn doctor     # check every prerequisite; OK/FIX + exact fix each
+auckland-vpn monitor    # optional watchdog that auto-heals a dead tunnel
+                        # (foreground; see "Auto-heal monitor" below)
+auckland-vpn diagnose   # doctor checks + failure analysis of the last attempt
 ```
 
 Running bare `auckland-vpn` (or an unknown command) shows help and exits 2 —
@@ -140,14 +143,78 @@ if you ever want to inspect it, but pinning is not used.
 - **Sudo behaviour of `start`:** passwordless once `setup-sudo` is done;
   otherwise it asks for your Mac password once (in non-interactive shells it
   explains how to install the helper instead of hanging).
-- **Sleep/wake:** openconnect tries to reconnect for up to 5 minutes
-  (`--reconnect-timeout=300`). If your Mac slept longer than that, the tunnel
-  is dead — run `auckland-vpn restart` (or check `auckland-vpn status`, which
-  tells you connected vs connecting vs not connected).
+- **Sleep/wake:** OpenConnect retries a dropped tunnel for up to 5 minutes
+  (`--reconnect-timeout=300`) — but ONLY if the FortiGate allows the old
+  session cookie to be reused, which is server-dependent and often NOT the
+  case. After sleep/wake (or any long network change) you may therefore need
+  a **fresh authentication**: run `auckland-vpn restart`, which re-authenticates
+  with your stored credentials and a brand-new TOTP code. The optional
+  `monitor` command below automates exactly that.
+- **Realm evidence:** on a successful login openconnect logs
+  `Got login realm 'client'`. If that line is missing from an attempt,
+  `auckland-vpn diagnose` flags it — that points at a realm/URL-path issue,
+  not necessarily bad credentials.
+
+## Auto-heal monitor (optional)
+
+`auckland-vpn monitor` is a foreground watchdog for when you want the tunnel
+kept up without babysitting it.
+
+**What it does** (design: `docs/consults/reliability.md`):
+
+- polls every 20 s using unprivileged checks only: is the pidfile PID alive
+  and still our openconnect; does a `utun` interface carry the tunnel IP;
+  does an end-to-end DNS query through the VPN resolver (vs. the system
+  resolver) return a sensible answer;
+- classifies `healthy / reconnecting / degraded / dead` with hysteresis so
+  one blip never triggers action: ~90 s reconnect grace, 2 consecutive DNS
+  failures before "degraded", ~30 s network-settle grace after death/wake;
+- heals a broken tunnel **only if you asked for one** — `start`/`restart`
+  mark the VPN wanted-up and `stop` un-marks it, so it never resurrects a
+  tunnel you intentionally stopped;
+- healing reuses the existing passwordless helper grant (`helper stop`, then
+  the same credential plumbing `start` uses) — **no new sudo rights**;
+- backs off exponentially between restarts (30 s → … → 15 min cap); after 5
+  failed attempts it opens a circuit breaker: no more starts for an hour,
+  plus a macOS notification. A manual `auckland-vpn start` clears it.
+
+**What it does NOT do:** no launchd/LaunchAgent installation, no root daemon,
+no auto-start at boot. Why (per the consult): plain polling survives sleep
+and network changes without private macOS event APIs, and a per-user
+foreground process keeps credential access and notifications inside YOUR
+login session — a root daemon would add privilege and secret-handling risk
+without improving the health decision. Supervise it yourself:
+
+```bash
+nohup auckland-vpn monitor >/dev/null 2>&1 &   # start watching
+pkill -f "auckland-vpn monitor"                # stop watching
+auckland-vpn monitor --once                    # single check, then exit
+```
+
+Handy knobs (environment variables): `INTERVAL`, `RECONNECT_GRACE`,
+`DEGRADED_THRESHOLD`, `DEGRADED_GRACE`, `NETWORK_SETTLE_GRACE`,
+`MAX_RESTART_ATTEMPTS`, `CIRCUIT_COOLDOWN`, `BACKOFF_CAP`. Set
+`AUCKLAND_VPN_DRY_RUN=1` to log what it *would* do without ever invoking
+sudo. State/counters live in `~/.local/state/auckland-vpn/`
+(`monitor-state`, `monitor.log`, `monitor.lock`); `doctor` reports whether
+the monitor is running and its last recorded state.
+
+## Known limitations
+
+- **Split DNS (upstream):** OpenConnect 9.x does not implement FortiNet's
+  dedicated `<split-dns>` configuration — it logs
+  `WARNING: Got split-DNS ... (not yet implemented)` and ignores it — so
+  university-internal names that depend on split-DNS may not resolve even
+  though the tunnel is up. No wrapper-side setting can fix this; it needs an
+  upstream OpenConnect change (`docs/consults/openconnect-audit.md` §5).
+- **Reconnect ≠ reauthentication:** Fortinet cookie reuse across drops is
+  server-dependent — see the sleep/wake note above; plan on
+  `auckland-vpn restart` doing a fresh login rather than resuming.
 
 ## Uninstall
 
 ```bash
+pkill -f "auckland-vpn monitor"                               # stop monitor
 auckland-vpn stop                                            # disconnect
 sudo rm /etc/sudoers.d/auckland-vpn                          # remove sudo rule
 sudo rm -rf /private/etc/auckland-vpn                        # remove helper + pidfile + staged vpnc-script

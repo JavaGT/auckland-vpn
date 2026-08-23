@@ -1,5 +1,7 @@
 # Auckland University VPN — reliable setup
 
+[![tests](https://github.com/JavaGT/auckland-vpn/actions/workflows/tests.yml/badge.svg)](https://github.com/JavaGT/auckland-vpn/actions/workflows/tests.yml)
+
 This replaces your flakey manual command:
 
 ```
@@ -210,6 +212,32 @@ the monitor is running and its last recorded state.
 - **Reconnect ≠ reauthentication:** Fortinet cookie reuse across drops is
   server-dependent — see the sleep/wake note above; plan on
   `auckland-vpn restart` doing a fresh login rather than resuming.
+
+## Testing
+
+The suite is plain Bash, no framework: `tests/run-tests.sh`. It covers static
+checks (`bash -n`, ShellCheck on the wrapper AND the generated privileged
+helper, plus security greps), unit tests of sourced functions, contract tests
+of the sudo/helper boundary with a fake `sudo`, and integration tests against
+a stubbed `openconnect` — all in private sandboxes.
+
+Run it locally (no sudo needed):
+
+```bash
+tests/run-tests.sh          # requires bash + shellcheck (brew install shellcheck)
+```
+
+CI runs exactly that script on a GitHub Actions macOS runner (see
+`.github/workflows/tests.yml`) — no root, no network access. What is **not**
+automated and stays manual-only:
+
+- the real privileged install (`auckland-vpn setup-sudo`: root ownership,
+  `/etc/sudoers.d` fragment, real `visudo`),
+- macOS Keychain authorization prompts,
+- connecting to the live University VPN (credentials, DNS/routes).
+
+**Contributing:** keep changes green — run `tests/run-tests.sh` before sending
+a PR; it must pass on stock macOS with only Homebrew ShellCheck installed.
 
 ## Uninstall
 

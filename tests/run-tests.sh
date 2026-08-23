@@ -2,7 +2,7 @@
 set -uo pipefail
 
 TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT="$(cd "$TEST_DIR/../.." && pwd)"
+ROOT="$(cd "$TEST_DIR/.." && pwd)"
 CLI="$ROOT/auckland-vpn"
 TMP_ROOT="$TEST_DIR/.tmp.$$"
 PASSED=0
@@ -161,11 +161,16 @@ configure_generated_helper() {
 }
 
 test_static_wrapper() {
+  local hit
   command -v shellcheck >/dev/null || fail 'shellcheck is required'
   bash -n "$CLI" || return
   shellcheck "$CLI" || return
   ! grep -nE 'mktemp -d[[:space:]]+/tmp|sudo[[:space:]]+pkill[[:space:]]+(-[A-Za-z]*[[:space:]]+)*openconnect' "$CLI" \
     || fail 'unsafe temp directory or unscoped pkill found'
+  # Every privileged invocation must stay interceptable via the wrapper-only
+  # $SUDO_BIN seam (issue #16): no literal 'sudo' command may bypass it.
+  hit="$(grep -nE 'sudo (-n )?"\$HELPER_BIN"|\| sudo |sudo (sh|pkill) ' "$CLI" | grep -vE '^[0-9]+:[[:space:]]*#' || true)"
+  [ -z "$hit" ] || fail "sudo call bypasses the \$SUDO_BIN seam: $hit"
 }
 
 test_static_generated_helper() {
@@ -788,6 +793,58 @@ test_diagnose_failure_classes() {
   assert_contains "$out" 'TRANSPORT: DTLS established.'
 }
 
+# Issue #16: the two consult-approved WRAPPER-ONLY seams
+# (docs/consults/test-architecture.md). AUCKLAND_VPN_HELPER_BIN /
+# AUCKLAND_VPN_SUDO_BIN redirect which helper the wrapper asks sudo to run,
+# and which sudo binary asks — honored only for an unprivileged caller. The
+# generated PRIVILEGED helper must contain ZERO environment switches: no
+# 'AUCKLAND_VPN' string at all (a behaviour switch inherited across sudo
+# would be a second, less-defended root execution path).
+test_wrapper_seams_are_wrapper_only() {
+  local box helper overridden defaulted
+  box="$(new_sandbox wrapper-seams)"
+  make_openconnect_stub "$box/bin/openconnect"
+  source_cli "$box"
+  configure_generated_helper "$box"
+  helper="$(generate_helper)"
+  assert_not_contains "$helper" 'AUCKLAND_VPN' || return 1
+
+  # The overrides are honoured when set...
+  overridden="$(VPN_USER='' \
+    AUCKLAND_VPN_HELPER_BIN="$box/fake-helper" AUCKLAND_VPN_SUDO_BIN="$box/fake-sudo" \
+    bash -c 'source "$1"; printf "%s|%s" "$HELPER_BIN" "$SUDO_BIN"' _ "$CLI")"
+  [ "$overridden" = "$box/fake-helper|$box/fake-sudo" ] \
+    || { fail "seams not honoured when set: $overridden"; return 1; }
+  # ...and inert when unset: production defaults.
+  defaulted="$(VPN_USER='' bash -c 'source "$1"; printf "%s|%s" "$HELPER_BIN" "$SUDO_BIN"' _ "$CLI")"
+  [ "$defaulted" = "/private/etc/auckland-vpn/helper|sudo" ] \
+    || { fail "unexpected seam defaults: $defaulted"; return 1; }
+}
+
+# Issue #16 promotion smoke: tests/ is the single suite location (no
+# prototype-suite copy, no symlink), directly executable, and CI runs exactly
+# this script on macOS.
+test_tests_dir_promoted_and_ci_runnable() {
+  local suite="$TEST_DIR/run-tests.sh" wf="$ROOT/.github/workflows/tests.yml"
+  [ -x "$suite" ] || { fail 'tests/run-tests.sh must be executable (CI invokes it directly)'; return 1; }
+  head -n 1 "$suite" | grep -q '^#!/usr/bin/env bash$' \
+    || { fail 'suite lost its bash shebang'; return 1; }
+  bash -n "$suite" || return 1
+  # Tripwire: references to the old prototype-suite location must be gone.
+  ! grep -q 'prototypes[/]' "$suite" \
+    || { fail 'stale prototype-suite path left behind'; return 1; }
+  # Consult-mandated security greps must remain part of the static lints.
+  grep -qF 'mktemp -d' "$suite" \
+    || { fail 'static lint lost the mktemp -d /tmp grep'; return 1; }
+  grep -qF 'pkill' "$suite" \
+    || { fail 'static lint lost the unscoped-pkill grep'; return 1; }
+  [ -f "$wf" ] || { fail '.github/workflows/tests.yml missing'; return 1; }
+  grep -qF 'macos-latest' "$wf" \
+    || { fail 'CI must run on macOS (BSD stat -f, macOS commands)'; return 1; }
+  grep -qF 'tests/run-tests.sh' "$wf" \
+    || { fail 'CI must invoke tests/run-tests.sh'; return 1; }
+}
+
 run_test() {
   local name="$1"
   if ( "$name" ); then
@@ -819,6 +876,8 @@ tests=(
   test_monitor_once_dead_fixture_dry_run
   test_doctor_reports_monitor_status
   test_diagnose_failure_classes
+  test_wrapper_seams_are_wrapper_only
+  test_tests_dir_promoted_and_ci_runnable
 )
 
 for test_name in "${tests[@]}"; do run_test "$test_name"; done

@@ -145,6 +145,27 @@ LOG_DIR="/private/var/log/auckland-vpn"
 LOG_FILE="$LOG_DIR/auckland-vpn.log"
 SUDOERS_FILE="/etc/sudoers.d/auckland-vpn"
 
+# Test seams (wrapper-side ONLY; design: docs/consults/test-architecture.md).
+# An UNPRIVILEGED test driver may redirect which helper program the wrapper
+# asks sudo to run (AUCKLAND_VPN_HELPER_BIN) and which sudo binary performs
+# the asking (AUCKLAND_VPN_SUDO_BIN, absolute path). This is safe because the
+# installed sudoers rule authorises ONLY the exact installed absolute helper
+# with exactly 'start'/'stop': a fake HELPER_BIN is simply rejected by real
+# sudo, and a fake SUDO_BIN executes as the current user — power anyone who
+# controls this user's environment already has. Neither variable is ever
+# granted through sudo (the fragment carries NOSETENV) and NEITHER is ever
+# consulted by the generated privileged helper, which bakes all site values
+# in at generation time and must contain zero environment switches.
+SUDO_BIN="sudo"
+if [ "$(/usr/bin/id -u)" -ne 0 ]; then
+  if [ -n "${AUCKLAND_VPN_HELPER_BIN:-}" ]; then
+    HELPER_BIN="$AUCKLAND_VPN_HELPER_BIN"
+  fi
+  if [ -n "${AUCKLAND_VPN_SUDO_BIN:-}" ]; then
+    SUDO_BIN="$AUCKLAND_VPN_SUDO_BIN"
+  fi
+fi
+
 # Optional auto-heal monitor (issue #14; design: docs/consults/reliability.md).
 # All private per-user state alongside the rest of STATE_DIR.
 MONITOR_ENABLED_FILE="$STATE_DIR/monitor.enabled"   # presence == VPN wanted up
@@ -352,7 +373,7 @@ wait_until_vpn_gone() {
     waited=$((waited + 1))
   done
   if [ -x "$HELPER_BIN" ]; then
-    sudo -n "$HELPER_BIN" stop >/dev/null 2>&1 || true
+    "$SUDO_BIN" -n "$HELPER_BIN" stop >/dev/null 2>&1 || true
   fi
 }
 
@@ -876,7 +897,7 @@ cmd_setup_sudo() {
   generate_installer >"$tmp/install.sh"
 
   echo "Installing root-owned helper + restricted sudoers rule (one sudo prompt)..."
-  sudo sh "$tmp/install.sh" \
+  "$SUDO_BIN" sh "$tmp/install.sh" \
     "$caller_uid" "$caller_gid" \
     "$HELPER_DIR" "$LOG_DIR" "$LOG_FILE" \
     "$SCRIPT_PATH" "$STAGED_VPNC_SCRIPT" \
@@ -1056,7 +1077,7 @@ read_token_secret() {
 # both drive the identical privileged surface.
 HELPER_START_ERR=""
 try_helper_start_n() { # try_helper_start_n <password> <token>
-  HELPER_START_ERR="$(printf '%s\n%s\n' "$1" "$2" | sudo -n "$HELPER_BIN" start 2>&1 >/dev/null)"
+  HELPER_START_ERR="$(printf '%s\n%s\n' "$1" "$2" | "$SUDO_BIN" -n "$HELPER_BIN" start 2>&1 >/dev/null)"
 }
 
 cmd_start() {
@@ -1110,7 +1131,7 @@ cmd_start() {
     if [ -t 0 ] && [[ "$HELPER_START_ERR" == *"a password is required"* ]]; then
       passwordless=0
       echo "(Passwordless sudo not set up — asking for your Mac password once.)"
-      if ! printf '%s\n%s\n' "$PASS" "$token" | sudo "$HELPER_BIN" start; then
+      if ! printf '%s\n%s\n' "$PASS" "$token" | "$SUDO_BIN" "$HELPER_BIN" start; then
         report_start_failure   # exits
       fi
     else
@@ -1159,7 +1180,7 @@ cmd_stop() {
   fi
   # Preferred path: the root-owned helper kills the exact recorded PID.
   if [ -x "$HELPER_BIN" ]; then
-    if sudo -n "$HELPER_BIN" stop; then
+    if "$SUDO_BIN" -n "$HELPER_BIN" stop; then
       return 0
     fi
     # NEVER pattern-kill when a pidfile exists: the exact-PID guarantee is the
@@ -1186,7 +1207,7 @@ stop_legacy_fallback() {
   if pgrep -f "$pat" >/dev/null 2>&1; then
     echo "Warning: helper unavailable; killing openconnect by pattern." >&2
     echo "         Run 'auckland-vpn setup-sudo' for the safe per-PID stop." >&2
-    sudo pkill -f "$pat" || die "could not stop openconnect."
+    "$SUDO_BIN" pkill -f "$pat" || die "could not stop openconnect."
     # pkill only SIGNALS; confirm the process is really gone before claiming
     # success (bounded ~5 s).
     while pgrep -f "$pat" >/dev/null 2>&1; do
@@ -1624,8 +1645,8 @@ monitor_network_ready() {
 monitor_heal() {
   local pass token stop_rc=0
   if [ "${AUCKLAND_VPN_DRY_RUN:-}" = "1" ]; then
-    echo "[dry-run] would run: sudo -n $HELPER_BIN stop"
-    echo "[dry-run] would run: sudo -n $HELPER_BIN start (with stored credentials)"
+    echo "[dry-run] would run: $SUDO_BIN -n $HELPER_BIN stop"
+    echo "[dry-run] would run: $SUDO_BIN -n $HELPER_BIN start (with stored credentials)"
     return 0
   fi
   if ! monitor_network_ready; then
@@ -1636,7 +1657,7 @@ monitor_heal() {
 
   # STOP phase — never via cmd_stop, which would clear the user's intent.
   if [ -x "$HELPER_BIN" ]; then
-    sudo -n "$HELPER_BIN" stop >/dev/null 2>&1 || stop_rc=$?
+    "$SUDO_BIN" -n "$HELPER_BIN" stop >/dev/null 2>&1 || stop_rc=$?
     if [ "$stop_rc" -ne 0 ]; then
       monitor_log "heal=stop-refused rc=$stop_rc"
       notify_user "VPN auto-heal paused: helper refused stop (stale pidfile?)"
@@ -1834,7 +1855,7 @@ cmd_doctor() {
   if [ ! -x "$HELPER_BIN" ]; then
     echo "FIX  privileged helper missing — 'start' will ask for your Mac password once. Install with: auckland-vpn setup-sudo"
     fixes=$((fixes + 1))
-  elif sudo -n -l "$HELPER_BIN start" >/dev/null 2>&1 && sudo -n -l "$HELPER_BIN stop" >/dev/null 2>&1; then
+  elif "$SUDO_BIN" -n -l "$HELPER_BIN start" >/dev/null 2>&1 && "$SUDO_BIN" -n -l "$HELPER_BIN stop" >/dev/null 2>&1; then
     # -l <cmd> exits 0 only when sudoers policy actually allows the command;
     # checking BOTH exact invocations avoids false OK from generic privileges.
     echo "OK   helper installed ($HELPER_BIN) and passwordless sudo allows it"

@@ -103,21 +103,31 @@ if you ever want to inspect it, but pinning is not used.
   or, if Keychain couldn't be used, in `~/.config/auckland-vpn/vpn-password`
   (mode 600).
 - To change either later: `auckland-vpn setup` (it re-runs the wizard).
-- **Logs** live in your private state dir:
-  `~/.local/state/auckland-vpn/auckland-vpn.log` (mode 700 dir, mode 600 log;
-  honour `XDG_STATE_HOME`). Each start rotates the previous attempt to
-  `auckland-vpn.log.prev` and stamps a `==== auckland-vpn start <date> ====`
-  banner, so history survives reboots and you can compare a good run with a
-  bad one. This tool creates nothing under `/tmp`.
+- **Logs** live in `/private/var/log/auckland-vpn/auckland-vpn.log` — a
+  file owned by *you* (mode 600) inside a **root-owned directory** created
+  by `setup-sudo`. The privileged helper only ever *appends* to it; it
+  never recreates or re-owns the file at runtime. Each attempt stamps a
+  `==== auckland-vpn start <date> ====`
+  banner and `status`/`log` read only the latest attempt, so history is
+  easy to compare even though the file keeps growing.
+- **The helper reads nothing from your home directory.** At start, this
+  script looks up your password in the Keychain, reads the TOTP secret
+  from `~/.config/auckland-vpn/totp-secret` itself, and hands both to the
+  privileged helper over its standard input — root-side code never opens
+  a user-owned path. The pidfile stays at
+  `/private/etc/auckland-vpn/vpn.pid`, owned by root, mode 644.
 - **`start` verifies the tunnel**: it polls for connected evidence for up to
   ~15 s ("verifying . . ."), prints `Connected as <user>. Tunnel IP: ...` on
   success, and on failure dumps the last 15 log lines inline before pointing
   at `auckland-vpn log`.
 - **One tunnel at a time**: starting while already connected is refused —
   use `auckland-vpn restart`, which confirms the old process is gone first.
-- **After upgrading this tool, re-run `auckland-vpn setup-sudo`.** The
-  privileged helper embeds the log path and other settings at install time,
-  so an old helper keeps writing to old locations until regenerated.
+- **After upgrading this tool, or after `brew upgrade openconnect`, re-run
+  `auckland-vpn setup-sudo`.** The privileged helper embeds the log path and
+  other settings at install time, and it uses its own root-owned **copy** of
+  the vpnc-script (`/private/etc/auckland-vpn/vpnc-script`) that setup-sudo
+  stages from Homebrew — so an old helper keeps writing to old locations and
+  running an old vpnc-script until regenerated.
 - **Sudo behaviour of `start`:** passwordless once `setup-sudo` is done;
   otherwise it asks for your Mac password once (in non-interactive shells it
   explains how to install the helper instead of hanging).
@@ -131,8 +141,9 @@ if you ever want to inspect it, but pinning is not used.
 ```bash
 auckland-vpn stop                                            # disconnect
 sudo rm /etc/sudoers.d/auckland-vpn                          # remove sudo rule
-sudo rm -rf /private/etc/auckland-vpn                        # remove helper + pidfile
+sudo rm -rf /private/etc/auckland-vpn                        # remove helper + pidfile + staged vpnc-script
+sudo rm -rf /private/var/log/auckland-vpn                    # remove the log directory
 security delete-generic-password -s auckland-vpn             # remove stored password
-rm -rf ~/.config/auckland-vpn ~/.local/state/auckland-vpn    # remove config + logs
+rm -rf ~/.config/auckland-vpn ~/.local/state/auckland-vpn    # remove config + state
 rm /opt/homebrew/bin/auckland-vpn                            # remove the script itself
 ```

@@ -169,9 +169,15 @@ load_config
 
 # True when the installed openconnect supports --pid-file (v8+). The helper
 # relies on it so 'stop' can kill an exact recorded PID instead of pkill.
+# NOTE: capture --help output first and grep it separately. A direct
+# 'openconnect --help | grep -q' pipe is broken under 'set -o pipefail'
+# because openconnect exits 1 after printing help — and grep -q's early
+# exit can also SIGPIPE the writer. Both made this check falsely fail.
 openconnect_supports_pid_file() {
   [ -x "$OPENCONNECT_BIN" ] || return 1
-  "$OPENCONNECT_BIN" --help 2>&1 | grep -q -- '--pid-file'
+  local help
+  help="$("$OPENCONNECT_BIN" --help 2>&1 || true)"
+  grep -q -- '--pid-file' <<<"$help"
 }
 
 # Create the private state directory lazily (only log-writing commands need

@@ -1,5 +1,14 @@
 # Auckland University VPN — reliable setup
 
+## Install
+
+```bash
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/JavaGT/auckland-vpn/main/install.sh)"
+```
+
+This installs Homebrew (if missing), `openconnect`, and `auckland-vpn` to your Homebrew bin.
+Then continue with One-time setup step 2 below.
+
 This replaces your flakey manual command:
 
 ```
@@ -39,7 +48,8 @@ there for you if it isn't set yet.)
 
 ## One-time setup
 
-1. **Install the script** (no sudo needed — `/opt/homebrew/bin` is on your PATH):
+1. **Install the script** — via the one-liner above, or manually
+   (no sudo needed — `/opt/homebrew/bin` is on your PATH):
 
    ```bash
    cp auckland-vpn /opt/homebrew/bin/auckland-vpn
@@ -81,6 +91,7 @@ auckland-vpn log        # last 50 log lines ('auckland-vpn log -f' follows)
 auckland-vpn stop       # disconnect
 auckland-vpn restart    # stop, confirm the old process is gone, start again
 auckland-vpn doctor     # check every prerequisite; OK/FIX + exact fix each
+auckland-vpn update     # self-update to the latest version from GitHub
 ```
 
 Running bare `auckland-vpn` (or an unknown command) shows help and exits 2 —
@@ -118,6 +129,7 @@ if you ever want to inspect it, but pinning is not used.
 - **After upgrading this tool, re-run `auckland-vpn setup-sudo`.** The
   privileged helper embeds the log path and other settings at install time,
   so an old helper keeps writing to old locations until regenerated.
+  (`auckland-vpn update` reminds you of this itself.)
 - **Sudo behaviour of `start`:** passwordless once `setup-sudo` is done;
   otherwise it asks for your Mac password once (in non-interactive shells it
   explains how to install the helper instead of hanging).

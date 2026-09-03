@@ -983,6 +983,44 @@ cmd_doctor() {
   echo "All checks passed."
 }
 
+# Self-update: replace the installed copy with the latest from GitHub.
+# Resolves the real install path (command -v), downloads to the private
+# state dir, syntax-checks before installing, and skips when already current.
+# Uses sudo only if the target isn't user-writable. After updating, re-run
+# setup-sudo: the helper embeds paths at install time.
+cmd_update() {
+  local repo="${AUCKLAND_VPN_REPO:-JavaGT/auckland-vpn}"
+  local branch="${AUCKLAND_VPN_BRANCH:-main}"
+  local url="https://raw.githubusercontent.com/$repo/$branch/auckland-vpn"
+  command -v curl >/dev/null 2>&1 || die "curl not found (macOS ships it at /usr/bin/curl)."
+  local target
+  target="$(command -v auckland-vpn 2>/dev/null || true)"
+  if [ -z "$target" ] || [ ! -f "$target" ]; then
+    target="${BASH_SOURCE[0]}"
+  fi
+  echo "Checking for updates from github.com/$repo@$branch ..."
+  ensure_state_dir
+  local tmp="$STATE_DIR/auckland-vpn.new"
+  curl -fsSL "$url" -o "$tmp" || die "download failed from $url (network/DNS up?)"
+  bash -n "$tmp" || die "downloaded script failed syntax check; not installing."
+  if [ -f "$target" ] && cmp -s "$tmp" "$target"; then
+    echo "Already up to date ($target)."
+    rm -f "$tmp"
+    return 0
+  fi
+  chmod +x "$tmp"
+  if cp "$tmp" "$target" 2>/dev/null; then
+    :
+  else
+    echo "Need sudo to write $target ..."
+    sudo cp "$tmp" "$target" || die "could not install update to $target"
+  fi
+  chmod +x "$target" 2>/dev/null || sudo chmod +x "$target"
+  rm -f "$tmp"
+  echo "Updated $target."
+  echo "If you use passwordless start, re-run: auckland-vpn setup-sudo"
+}
+
 usage() {
   cat <<EOF
 auckland-vpn — reliable University of Auckland VPN (FortiNet + TOTP 2FA)
@@ -997,6 +1035,7 @@ auckland-vpn — reliable University of Auckland VPN (FortiNet + TOTP 2FA)
   log         last 50 log lines ('log -f' follows until Ctrl-C)
   pin         print the current server certificate fingerprint
   doctor      check every prerequisite; prints OK/FIX + exact fix per item
+  update      self-update to the latest version from GitHub
 
 Examples:
   auckland-vpn setup
@@ -1024,6 +1063,7 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     log)         shift; cmd_log "$@" ;;
     pin)         cmd_pin ;;
     doctor)      cmd_doctor ;;
+    update)      cmd_update ;;
     -h|--help|help) usage ;;
     *) usage; exit 2 ;;
   esac

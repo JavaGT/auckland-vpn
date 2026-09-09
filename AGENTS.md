@@ -20,5 +20,17 @@ automatically, and DNS is handled by the Homebrew `vpnc-script`. Installed as
 
 ## Testing
 
-Local: `tests/run-tests.sh`. CI: GitHub Actions `tests` workflow. Design
-consults live in `docs/consults/` (reliability, test architecture).
+Local: `tests/run-tests.sh` (requires ShellCheck: `brew install shellcheck`).
+CI: GitHub Actions `tests` workflow. Privileged paths are tested through the
+wrapper-only seams `AUCKLAND_VPN_HELPER_BIN` / `AUCKLAND_VPN_SUDO_BIN`, never
+by patching the helper (see `docs/consults/test-architecture.md`). Design
+consults live in `docs/consults/` (reliability, test architecture,
+openconnect audit).
+
+## Agent hygiene
+
+- Pain journal: `~/.config/opencode/pain-journals/auckland-vpn.md` — when
+  tooling/config/process friction costs you time, append one line there
+  without stopping your task work.
+- README.md is the full behaviour reference (commands, flags, limits);
+  AGENTS.md holds constraints, README holds what the tool does.

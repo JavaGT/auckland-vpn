@@ -1,5 +1,12 @@
 # Reliability design for `auckland-vpn`
 
+> **Status (2026-09-10):** the `monitor` command shipped **foreground-only** —
+> LaunchAgent supervision was consciously not implemented (see README
+> "Auto-heal monitor"). The state file is `monitor-state` (not `monitor.state`)
+> in `~/.local/state/auckland-vpn/`. The `sudo -n` verification below is a
+> one-shot check of the helper grant before enabling auto-heal; it does not
+> license `sudo -n true` as a liveness probe, which AGENTS.md forbids.
+
 ## Decision
 
 Add an opt-in `auckland-vpn monitor` foreground command and supervise it with a

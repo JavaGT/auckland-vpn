@@ -1,5 +1,9 @@
 # Auckland VPN Test Architecture
 
+> **Status (2026-09-10):** the suite now lives at `tests/run-tests.sh`
+> (promoted from `prototypes/tests/` in issue #16). `prototypes/` paths below
+> are historical.
+
 ## Recommendation
 
 Use a small plain-Bash test runner initially. This repository has one Bash

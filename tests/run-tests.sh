@@ -11,8 +11,14 @@ FAILED=0
 mkdir -p "$TMP_ROOT"
 trap 'rm -rf "$TMP_ROOT"' EXIT
 
+# Record failures on disk as well as returning 1: run_test scores a test on
+# its subshell's FINAL exit status, so a `cmd || fail` chain would otherwise
+# swallow a mid-test failure whenever a later command exits 0. A marker file
+# crosses the subshell boundary; `exit 1` here would not (it would also fire
+# the main shell's TMP_ROOT-cleanup EXIT trap and break later tests).
 fail() {
   printf '    %s\n' "$*" >&2
+  : > "$TMP_ROOT/.test-failed"
   return 1
 }
 
@@ -846,8 +852,12 @@ test_tests_dir_promoted_and_ci_runnable() {
 }
 
 run_test() {
-  local name="$1"
-  if ( "$name" ); then
+  local name="$1" status=0
+  rm -f "$TMP_ROOT/.test-failed"
+  ( "$name" ) || status=1
+  # A recorded failure fails the test even if the subshell exited 0.
+  [ -e "$TMP_ROOT/.test-failed" ] && status=1
+  if [ "$status" -eq 0 ]; then
     printf 'ok - %s\n' "$name"
     PASSED=$((PASSED + 1))
   else

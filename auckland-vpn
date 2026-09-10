@@ -1644,8 +1644,9 @@ monitor_network_ready() {
 }
 
 # One heal cycle over the EXISTING privileged surface only: helper stop,
-# confirm gone, helper start with stored credentials (identical plumbing to
-# cmd_start via try_helper_start_n). Returns 0 ok/dry-run/deferred, 1 failed
+# wait out the old process (best-effort), helper start with stored
+# credentials (identical plumbing to cmd_start via try_helper_start_n).
+# Returns 0 ok/dry-run/deferred, 1 failed
 # attempt, 3 stop refused (consult: enter the circuit breaker).
 monitor_heal() {
   local pass token stop_rc=0
@@ -1996,7 +1997,7 @@ auckland-vpn — reliable University of Auckland VPN (FortiNet + TOTP 2FA)
   start       connect (auto 2FA, auto-reconnect; verifies the tunnel came up;
               needs the privileged helper installed by setup-sudo)
   stop        disconnect
-  restart     stop, confirm gone, then start
+  restart     stop, wait out the old process, then start
   status      Connected as ... (pid, IP) / Connecting... / Not connected.
   monitor     supervise the tunnel and auto-restart it when it dies [--once]
               (only heals tunnels that 'start' marked as wanted)

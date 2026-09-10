@@ -72,3 +72,9 @@ the slot timestamp (0930) and marked `unsupplied-` rather than fabricated to loo
   - 09:48 3 background review children dispatched (reviewer + 2 consultants, same candidate pack).
   - 09:56 verdicts reconciled: reviewer APPROVED ×3 lenses; consultants AGREE/AGREE. #38/#39 closed
     with evidence; #40 updated (stays open, evaluate framing); #21 annotated for the 09-17 sweep.
+
+### Addendum — push deferred (10:05)
+
+- origin/main and main have DIVERGED: 13 local-only commits (incl. 4e885f6, 9e0e4e2) vs 2 remote-only
+  (pre-burst install.sh/update lineage). This is open decision ticket #37 — deciding the canonical
+  lineage is not this wave's call; no push, no merge, no force. Both new commits are safe on local main.

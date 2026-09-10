@@ -83,7 +83,8 @@ auckland-vpn status     # Connected as you (pid, tunnel IP) / Connecting... /
                         # Not connected.
 auckland-vpn log        # last 50 log lines ('auckland-vpn log -f' follows)
 auckland-vpn stop       # disconnect
-auckland-vpn restart    # stop, confirm the old process is gone, start again
+auckland-vpn restart    # stop, wait out the old process, start again (a
+                        # survivor makes the start refuse rather than race)
 auckland-vpn doctor     # check every prerequisite; OK/FIX + exact fix each
 auckland-vpn monitor    # optional watchdog that auto-heals a dead tunnel
                         # (foreground; see "Auto-heal monitor" below)
@@ -137,7 +138,8 @@ if you ever want to inspect it, but pinning is not used.
   success, and on failure dumps the last 15 log lines inline before pointing
   at `auckland-vpn log`.
 - **One tunnel at a time**: starting while already connected is refused —
-  use `auckland-vpn restart`, which confirms the old process is gone first.
+  use `auckland-vpn restart`, which waits out the old process first; if it
+  somehow survived, the start half refuses rather than racing it.
 - **After upgrading this tool, or after `brew upgrade openconnect`, re-run
   `auckland-vpn setup-sudo`.** The privileged helper embeds the log path and
   other settings at install time, and it uses its own root-owned **copy** of

@@ -359,10 +359,13 @@ refuse_if_already_running() {
   fi
 }
 
-# After stop, confirm the old process is REALLY gone before starting anew:
-# SIGTERM delivery is not process death, and launching beside a dying tunnel
-# means two clients fighting over utun/DNS/routes. Bounded ~10s, then one
-# escalation through the helper (whose stop path escalates to SIGKILL).
+# After stop, wait out the old process before starting anew: SIGTERM delivery
+# is not process death, and launching beside a dying tunnel means two clients
+# fighting over utun/DNS/routes. Best-effort only: ~10s poll, then a single
+# helper stop whose output is discarded here. The helper deliberately never
+# escalates to SIGKILL (recycled-PID hazard); it reports a survivor on its own
+# stop command, so callers that must not race one re-check (cmd_start's
+# already-running guard).
 wait_until_vpn_gone() {
   local waited=0 pid
   while :; do
@@ -1226,9 +1229,9 @@ stop_legacy_fallback() {
   fi
 }
 
-# restart = stop, WAIT until the old process is really gone (SIGTERM delivery
-# is not death — a blind sleep launched a second tunnel beside a dying one),
-# then start. cmd_start's already-running guard backs this up.
+# restart = stop, wait out the old process (best-effort: see
+# wait_until_vpn_gone), then start. cmd_start's already-running guard is the
+# actual guarantee that a survivor cannot race a second tunnel.
 cmd_restart() {
   cmd_stop
   wait_until_vpn_gone

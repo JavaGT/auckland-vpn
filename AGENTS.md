@@ -40,3 +40,6 @@ openconnect audit).
   and `artifacts/` (`reports/` + `automation-receipts/`). Check these and the
   open `[quick-scan]` / `[config-review]` tracker issues before re-deriving
   a known finding.
+- Long reads: the Read tool can garble or interleave lines on large file
+  slices (seen 2026-09-11). Re-verify any candidate finding from a long read
+  with `sed`/`grep` at the exact lines before ticketing or editing it.

@@ -21,6 +21,8 @@ automatically, and DNS is handled by the Homebrew `vpnc-script`. Installed as
 ## Testing
 
 Local: `tests/run-tests.sh` (requires ShellCheck: `brew install shellcheck`).
+Focused iteration: `tests/run-tests.sh monitor` runs only tests whose names
+match the given substrings; no arguments runs the full suite (what CI runs).
 CI: GitHub Actions `tests` workflow. Privileged paths are tested through the
 wrapper-only seams `AUCKLAND_VPN_HELPER_BIN` / `AUCKLAND_VPN_SUDO_BIN`, never
 by patching the helper (see `docs/consults/test-architecture.md`). Design
@@ -34,3 +36,7 @@ openconnect audit).
   without stopping your task work.
 - README.md is the full behaviour reference (commands, flags, limits);
   AGENTS.md holds constraints, README holds what the tool does.
+- Prior automation findings live in-repo: `docs/reports/` (2026-09-10 wave)
+  and `artifacts/` (`reports/` + `automation-receipts/`). Check these and the
+  open `[quick-scan]` / `[config-review]` tracker issues before re-deriving
+  a known finding.

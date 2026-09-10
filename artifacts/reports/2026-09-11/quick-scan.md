@@ -6,7 +6,7 @@ promotion + monitor). Files walked: `auckland-vpn` (wrapper + generated
 helper, sliced), `tests/run-tests.sh`, `.github/workflows/tests.yml`,
 README.md, AGENTS.md. Findings deduped against open issues #22-#40 first.
 
-All findings below are ticketed as confirmed. Ranked by strength x leverage.
+All findings below are ticketed (confirmed vs Speculative/Evaluate as labeled per finding). Ranked by strength x leverage.
 
 ## Findings
 

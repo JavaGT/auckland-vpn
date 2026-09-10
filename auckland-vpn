@@ -773,7 +773,8 @@ detect_legacy_rule() {
 }
 
 # The canonical explanation shown wherever passwordless setup is missing.
-# Note: 'start' works without it — it just asks for the Mac password once.
+# Note: 'start' needs the helper installed by setup-sudo; without it, start
+# refuses here with these instructions.
 print_sudoers_hint() {
   echo "Passwordless start is not installed. Run once:"
   echo "  auckland-vpn setup-sudo"
@@ -781,7 +782,8 @@ print_sudoers_hint() {
   echo "allowing ONLY 'helper start' / 'helper stop' — never raw openconnect"
   echo "(granting the raw binary allowed arbitrary root code execution via"
   echo "--script=, and the old pkill grant could kill any root process)."
-  echo "Until then, 'auckland-vpn start' simply asks for your Mac password once."
+  echo "Until then, 'auckland-vpn start' refuses — the privileged helper is what"
+  echo "launches the tunnel; run 'auckland-vpn setup-sudo' to install it."
   detect_legacy_rule /etc/sudoers /etc/sudoers.d/* \
     || echo "Fix the warning(s) above so they cannot undermine the new rule." >&2
   return 0
@@ -1853,7 +1855,7 @@ cmd_doctor() {
   fi
 
   if [ ! -x "$HELPER_BIN" ]; then
-    echo "FIX  privileged helper missing — 'start' will ask for your Mac password once. Install with: auckland-vpn setup-sudo"
+    echo "FIX  privileged helper missing — 'start' refuses until it is installed. Install with: auckland-vpn setup-sudo"
     fixes=$((fixes + 1))
   elif "$SUDO_BIN" -n -l "$HELPER_BIN start" >/dev/null 2>&1 && "$SUDO_BIN" -n -l "$HELPER_BIN stop" >/dev/null 2>&1; then
     # -l <cmd> exits 0 only when sudoers policy actually allows the command;
@@ -1989,7 +1991,7 @@ auckland-vpn — reliable University of Auckland VPN (FortiNet + TOTP 2FA)
   setup       one-time: store VPN password (Keychain) + TOTP secret
   setup-sudo  one sudo prompt: install root-owned helper + restricted sudoers rule
   start       connect (auto 2FA, auto-reconnect; verifies the tunnel came up;
-              asks for your Mac password once unless setup-sudo is done)
+              needs the privileged helper installed by setup-sudo)
   stop        disconnect
   restart     stop, confirm gone, then start
   status      Connected as ... (pid, IP) / Connecting... / Not connected.

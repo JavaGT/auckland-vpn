@@ -41,10 +41,11 @@ there for you if it isn't set yet.)
 
 ## One-time setup
 
-1. **Install the script** (no sudo needed — `/opt/homebrew/bin` is on your PATH):
+1. **Install the script** (no sudo needed — use your Homebrew prefix:
+   `/opt/homebrew` on Apple Silicon, `/usr/local` on Intel):
 
    ```bash
-   cp auckland-vpn /opt/homebrew/bin/auckland-vpn
+   cp auckland-vpn /opt/homebrew/bin/auckland-vpn   # /usr/local/bin/... on Intel
    chmod +x /opt/homebrew/bin/auckland-vpn
    ```
 
@@ -69,8 +70,9 @@ there for you if it isn't set yet.)
 
    It also offers an *optional* one-liner that installs a restricted,
    root-owned helper so `auckland-vpn start` runs without typing your Mac
-   password. Without it, everything still works — `start` just asks for your
-   Mac password once per connection instead.
+   password. That helper is what launches the tunnel, so `start` needs it:
+   if you skip this step now, `start` will tell you to run `setup-sudo`
+   before it can connect.
 
 ## Daily use
 
@@ -142,9 +144,12 @@ if you ever want to inspect it, but pinning is not used.
   the vpnc-script (`/private/etc/auckland-vpn/vpnc-script`) that setup-sudo
   stages from Homebrew — so an old helper keeps writing to old locations and
   running an old vpnc-script until regenerated.
-- **Sudo behaviour of `start`:** passwordless once `setup-sudo` is done;
-  otherwise it asks for your Mac password once (in non-interactive shells it
-  explains how to install the helper instead of hanging).
+- **Sudo behaviour of `start`:** `start` needs the privileged helper that
+  `setup-sudo` installs — without it, it exits with that exact instruction.
+  Once installed, connecting is passwordless; if the helper exists but its
+  passwordless rule is not active (e.g. the sudoers fragment was removed),
+  `start` asks for your Mac password once (in non-interactive shells it
+  explains how instead of hanging).
 - **Sleep/wake:** OpenConnect retries a dropped tunnel for up to 5 minutes
   (`--reconnect-timeout=300`) — but ONLY if the FortiGate allows the old
   session cookie to be reused, which is server-dependent and often NOT the
@@ -164,13 +169,18 @@ kept up without babysitting it.
 
 **What it does** (design: `docs/consults/reliability.md`):
 
-- polls every 20 s using unprivileged checks only: is the pidfile PID alive
-  and still our openconnect; does a `utun` interface carry the tunnel IP;
-  does an end-to-end DNS query through the VPN resolver (vs. the system
-  resolver) return a sensible answer;
+- polls every 20 s using unprivileged checks only. Out of the box it checks
+  the one signal it can always trust: is the pidfile PID alive and still our
+  openconnect. Three finer probes — a `utun` interface carrying the tunnel
+  IP, the route to a university-internal IP, and end-to-end DNS through the
+  VPN resolver (vs. the system resolver) — switch on only when you configure
+  `VPN_HEALTH_HOST`, `VPN_HEALTH_IP` and `VPN_DNS_SERVER` (see knobs below);
+  until then those observations report `unknown` and only a dead tunnel is
+  acted on;
 - classifies `healthy / reconnecting / degraded / dead` with hysteresis so
   one blip never triggers action: ~90 s reconnect grace, 2 consecutive DNS
-  failures before "degraded", ~30 s network-settle grace after death/wake;
+  failures before "degraded" (configured probes only), ~30 s network-settle
+  grace after death/wake;
 - heals a broken tunnel **only if you asked for one** — `start`/`restart`
   mark the VPN wanted-up and `stop` un-marks it, so it never resurrects a
   tunnel you intentionally stopped;
@@ -195,7 +205,11 @@ auckland-vpn monitor --once                    # single check, then exit
 
 Handy knobs (environment variables): `INTERVAL`, `RECONNECT_GRACE`,
 `DEGRADED_THRESHOLD`, `DEGRADED_GRACE`, `NETWORK_SETTLE_GRACE`,
-`MAX_RESTART_ATTEMPTS`, `CIRCUIT_COOLDOWN`, `BACKOFF_CAP`. Set
+`MAX_RESTART_ATTEMPTS`, `CIRCUIT_COOLDOWN`, `BACKOFF_CAP`. Deep probes also
+need site values: `VPN_HEALTH_HOST` (a hostname the VPN's DNS should
+resolve, e.g. an internal health record), `VPN_HEALTH_IP` (a stable
+university-internal IP whose route must use the tunnel), and
+`VPN_DNS_SERVER` (the VPN resolver IP pushed to the tunnel). Set
 `AUCKLAND_VPN_DRY_RUN=1` to log what it *would* do without ever invoking
 sudo. State/counters live in `~/.local/state/auckland-vpn/`
 (`monitor-state`, `monitor.log`, `monitor.lock`); `doctor` reports whether

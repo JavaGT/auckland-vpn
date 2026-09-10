@@ -7,6 +7,7 @@ CLI="$ROOT/auckland-vpn"
 TMP_ROOT="$TEST_DIR/.tmp.$$"
 PASSED=0
 FAILED=0
+failed_names=()
 
 mkdir -p "$TMP_ROOT"
 trap 'rm -rf "$TMP_ROOT"' EXIT
@@ -863,6 +864,7 @@ run_test() {
   else
     printf 'not ok - %s\n' "$name"
     FAILED=$((FAILED + 1))
+    failed_names+=("$name")
   fi
 }
 
@@ -890,6 +892,35 @@ tests=(
   test_tests_dir_promoted_and_ci_runnable
 )
 
-for test_name in "${tests[@]}"; do run_test "$test_name"; done
-printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
+# Usage: tests/run-tests.sh [substring ...]
+# No arguments runs the full suite (CI invokes it exactly this way).
+# Substring arguments select a focused subset for quick iteration, e.g.
+#   tests/run-tests.sh monitor          # every test matching "monitor"
+#   tests/run-tests.sh config seams     # union of both matches
+selected=()
+for test_name in "${tests[@]}"; do
+  if [ "$#" -gt 0 ]; then
+    keep=0
+    for pattern in "$@"; do
+      case "$test_name" in *"$pattern"*) keep=1 ;; esac
+    done
+    [ "$keep" -eq 1 ] || continue
+  fi
+  selected+=("$test_name")
+done
+
+if [ "${#selected[@]}" -eq 0 ]; then
+  printf 'no tests match any of: %s\n' "$*" >&2
+  exit 1
+fi
+
+for test_name in "${selected[@]}"; do run_test "$test_name"; done
+printf '\n%d passed, %d failed (%d of %d tests selected)\n' \
+  "$PASSED" "$FAILED" "${#selected[@]}" "${#tests[@]}"
+# Failure names repeat at the end so an agent/CI log tail shows what broke
+# without scrolling through the whole run.
+if [ "${#failed_names[@]}" -gt 0 ]; then
+  printf 'failed:\n'
+  printf '  - %s\n' "${failed_names[@]}"
+fi
 [ "$FAILED" -eq 0 ]

@@ -43,3 +43,6 @@ openconnect audit).
 - Long reads: the Read tool can garble or interleave lines on large file
   slices (seen 2026-09-11). Re-verify any candidate finding from a long read
   with `sed`/`grep` at the exact lines before ticketing or editing it.
+- Inline automation route policies embed a `verified_at`/`stale_after` window
+  that can be stale by run time (#54). Before dispatching, re-verify the exact
+  `--agent`/`--model` pairs against `~/.config/opencode/MODEL-ROUTING.md`.

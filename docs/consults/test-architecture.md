@@ -70,7 +70,8 @@ Functions needing a production seam for focused tests:
 - `cmd_setup_sudo` combines artifact creation, validation, privileged install,
   and legacy-rule scanning.
 - The generated helper combines trust checks, credential input, process launch,
-  pidfile polling, ownership changes, and stop escalation.
+  pidfile polling, ownership changes, and the stop path's deliberate
+  no-escalation refusal.
 
 Do not mock every command inside these orchestration functions. Cover their
 policy with contract/integration tests and extract only stable boundaries when
@@ -159,8 +160,8 @@ pidfile removal. Timeout and PID reuse remain to add.
 2026-09-12 truth-up (#52): TERM-to-KILL escalation was deliberately NOT
 adopted. The shipped helper kills the recorded PID only while it still belongs
 to our openconnect and breaks without escalating, so SIGKILL never lands on a
-recycled PID (auckland-vpn:691-705); the wrapper's post-stop wait likewise
-never escalates and reports a survivor on its own (auckland-vpn:362-366).
+recycled PID (auckland-vpn:693-707); the wrapper's post-stop wait likewise
+never escalates and reports a survivor on its own (auckland-vpn:364-368).
 Coverage should target that refusal-and-survivor behavior, not a forced
 escalation.
 

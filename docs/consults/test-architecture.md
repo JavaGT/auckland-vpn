@@ -151,10 +151,18 @@ The stub must:
 
 The promoted integration suite should cover start success, auth failure,
 missing pidfile timeout with `sleep` faked, exact argv, password re-feed, log
-rotation, stale successful marker rejection, exact-PID stop, PID reuse refusal,
-and TERM-to-KILL escalation. The prototype success test starts a long-lived stub
+rotation, stale successful marker rejection, exact-PID stop, and PID reuse
+refusal. The prototype success test starts a long-lived stub
 whose command line is PID-verifiable, then stops it and checks process and
-pidfile removal. Timeout, PID reuse, and forced escalation remain to add.
+pidfile removal. Timeout and PID reuse remain to add.
+
+2026-09-12 truth-up (#52): TERM-to-KILL escalation was deliberately NOT
+adopted. The shipped helper kills the recorded PID only while it still belongs
+to our openconnect and breaks without escalating, so SIGKILL never lands on a
+recycled PID (auckland-vpn:691-705); the wrapper's post-stop wait likewise
+never escalates and reports a survivor on its own (auckland-vpn:362-366).
+Coverage should target that refusal-and-survivor behavior, not a forced
+escalation.
 
 Path injection should become explicit for black-box tests. Add a wrapper-only
 `AUCKLAND_VPN_OPENCONNECT_BIN` override before normal resolution, but accept it
@@ -221,7 +229,7 @@ network mutations are unsafe and nondeterministic.
 | `test_privileged_command_contract` | Contract | Helper accepts extra operations; sudo grant broadens to raw openconnect/pkill | Yes |
 | `test_start_success_with_stub_openconnect` | Integration | Wrong fixed argv, lost stdin password, missing pid/log verification, wrong success output, or exact-PID stop failure | Yes |
 | `test_start_auth_failure_with_stub_openconnect` | Integration | Authentication failure reported as connected or useful log detail hidden | Yes |
-| Helper PID reuse/escalation fixtures | Integration (promote next) | PID reuse, stale pidfile, failed TERM-to-KILL escalation | Yes |
+| Helper PID reuse/stop-refusal fixtures | Integration (promote next) | PID reuse, stale pidfile, stop-refused survivor report (escalation deliberately not implemented, see truth-up above) | Yes |
 | Root install/ownership/sudoers authorization | System | Wrong owner/mode, invalid sudoers, environment preservation across sudo | No; dedicated disposable Mac only |
 | Real University connection smoke | E2E | Endpoint/certificate/TOTP/DNS/route behavior | No; manual only |
 
@@ -231,7 +239,8 @@ network mutations are unsafe and nondeterministic.
    `tests/fixtures/`; add the macOS CI job.
 2. Make generated-artifact `bash -n` and ShellCheck mandatory. This needs no
    production seam because sourcing and post-source variable assignment work.
-3. Add a test-owned long-lived process fixture for helper stop and escalation.
+3. Add a test-owned long-lived process fixture for helper stop, including the
+   stop-refused survivor path (escalation is deliberately not implemented).
    Keep the helper unchanged; fake `ps`, `kill`, and `sleep` only if real
    test-owned process behavior cannot be made deterministic.
 4. Add wrapper-only helper/sudo command overrides only if executable-level

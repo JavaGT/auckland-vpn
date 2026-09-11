@@ -10,9 +10,11 @@
 #     fallback if Keychain can't prompt in your current shell).
 #   * --reconnect-timeout keeps the tunnel auto-reconnecting if it drops
 #     (this build has no --persistent flag).
-#   * Certificate trust uses the system's trusted CAs (the gateway cert is from
-#     DigiCert). We deliberately do NOT pin a specific cert, because the
-#     university's gateway certificate rotates — pinning would just break later.
+#   * Certificate trust uses OpenConnect's default CA verification — for this
+#     Homebrew build, GnuTLS with the Mozilla root store (NOT the macOS
+#     Keychain; gateway cert is from DigiCert). We deliberately do NOT pin a
+#     specific cert, because the university's gateway certificate rotates —
+#     pinning would just break later.
 #   * The Homebrew vpnc-script (already installed) sets DNS correctly via
 #     scutil, which is the usual cause of "connected but nothing resolves".
 #

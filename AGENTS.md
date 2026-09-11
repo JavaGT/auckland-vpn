@@ -8,7 +8,8 @@ automatically, and DNS is handled by the Homebrew `vpnc-script`. Installed as
 ## Design decisions that look wrong but are deliberate
 
 - **No certificate pinning** — the university gateway cert rotates, so pinning
-  would break on rotation. Trust the system CAs.
+  would break on rotation. Trust OpenConnect's default GnuTLS CA store (Mozilla
+  roots); a Keychain-added root is not trusted (#25).
 - **Config file is parsed, never executed** — only blank lines, `#comments`,
   and `VPN_USER=<username>` lines are accepted. Preserve this property in any
   refactor.

@@ -20,9 +20,11 @@ with a single, dependable command: `auckland-vpn start`.
 - **DNS was set up inconsistently** (the usual "connected but sites won't load"
   symptom). The Homebrew `vpnc-script` already on your Mac fixes DNS properly;
   this script makes sure it's used.
-- **Certificate handling.** We trust the system's Certificate Authorities (the
-  gateway cert is from DigiCert). We deliberately don't pin a specific cert,
-  because the university's gateway cert rotates — pinning would just break later.
+- **Certificate handling.** We rely on OpenConnect's default CA verification —
+  for this Homebrew build that is GnuTLS with the Mozilla root store (Homebrew
+  `ca-certificates`), not the macOS Keychain (the gateway cert is from
+  DigiCert). We deliberately don't pin a specific cert, because the
+  university's gateway cert rotates — pinning would just break later.
 
 ## Configuration (your username)
 
@@ -96,10 +98,13 @@ it never touches the network implicitly.
 
 ## Certificates
 
-We rely on your Mac's built-in trusted Certificate Authorities (the gateway cert
-is from DigiCert), so certificate rotation is handled automatically — nothing to
-update. The `auckland-vpn pin` command still prints the current cert fingerprint
-if you ever want to inspect it, but pinning is not used.
+We rely on OpenConnect's default CA verification — this Homebrew build uses
+GnuTLS with the Mozilla root store (Homebrew `ca-certificates`), not the macOS
+Keychain — and the gateway cert is from DigiCert, so certificate rotation is
+handled automatically; nothing to update. Troubleshooting note: a root CA you
+add to your Keychain is *not* automatically trusted here. The `auckland-vpn
+pin` command still prints the current cert fingerprint if you ever want to
+inspect it, but pinning is not used.
 
 ## Notes
 

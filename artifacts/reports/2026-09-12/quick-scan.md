@@ -21,8 +21,9 @@ workflow YAML). Prior findings #22–#52 taken as read, not re-derived.
   (README.md:86,141 vs `auckland-vpn:362-375`) — the #42 docs truth-up landed
   consistently.
 - Config parser: duplicate *conflicting* `VPN_USER` lines die with line numbers
-  (`auckland-vpn:117-119`); identical duplicates are inert, and setup's save
-  path only writes when `VPN_USER` is empty (`auckland-vpn:1000-1008`), so it
+  (`auckland-vpn:120`); identical duplicates are inert, and setup's save path
+  (`save_vpn_user_to_config`, `auckland-vpn:996-1008`) runs only when
+  `VPN_USER` is empty (`cmd_setup` gate, `auckland-vpn:1011-1018`), so it
   cannot create them.
 - `.github/workflows/tests.yml` parses clean (ruby `YAML.safe_load`) — the
   local YAML surface is currently valid; the CI-never-ran state remains #48/#37.

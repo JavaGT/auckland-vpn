@@ -9,12 +9,12 @@
 >
 > **Status (2026-09-13, #56):** the shipped breaker does not implement the
 > §backoff and circuit breaker triggers as specified: `restart_attempts` counts
-> cumulatively with no 30-minute window (`MAX_RESTART_ATTEMPTS=5`,
-> `auckland-vpn:1271`), and the flap-loop trigger (3 reconnects) is not
-> implemented. The backoff cap of 15 minutes vs the spec's 10 was judged
-> deliberate on 2026-09-10 and stays. Whether the windowed/flap-aware triggers
-> are worth implementing is open in #56 — do not treat the spec text below as
-> a description of shipped behavior.
+> consecutive failed restarts with no 30-minute window (`MAX_RESTART_ATTEMPTS=5`,
+> reset after sustained health at `auckland-vpn:1540-1542`), and the flap-loop
+> trigger (3 reconnects) is not implemented. The backoff cap of 15 minutes vs
+> the spec's 10 was judged deliberate on 2026-09-10 and stays. Whether the
+> windowed/flap-aware triggers are worth implementing is open in #56 — do not
+> treat the spec text below as a description of shipped behavior.
 
 ## Decision
 

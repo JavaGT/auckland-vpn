@@ -8,15 +8,16 @@ sweep. All 26 open issues at start were treated as settled; nothing re-derived.
 ## Findings
 
 - **#56 (new, evaluate-framed)** — The consult's breaker spec
-  (`reliability.md:366-371`) has two triggers the shipped breaker does not
+  (`reliability.md:375-378`) has two triggers the shipped breaker does not
   implement: the windowed "5 attempts within 30 minutes" rule (code counts
-  cumulatively, `auckland-vpn:1271`, `:1614-1618`) and the flap-loop trigger
-  (no flap logic exists). The 09-10 report (`docs/reports/2026-09-10-quick-scan.md:152-155`)
-  scoped both "inside #22/#23" but neither body mentions them (checked via
-  `gh issue view`) — the disposition pointer led nowhere on the tracker. The
-  backoff-cap facet (15 vs 10 min) was judged deliberate on 09-10 and is
-  excluded. Doc truth-up applied: status addenda added to `reliability.md`
-  (same pattern as the 2026-09-10 addendum from #19).
+  consecutive failed attempts, `auckland-vpn:1271`, `:1614-1618`, reset after
+  sustained health `:1540-1542`) and the flap-loop trigger (no flap logic
+  exists). The 09-10 report (`docs/reports/2026-09-10-quick-scan.md:153-155`)
+  scoped only the flap-loop facet "inside #22/#23" — neither body mentions
+  either trigger (checked via `gh issue view`) — and the windowed rule appears
+  in no prior report. The backoff-cap facet (15 vs 10 min) was judged
+  deliberate on 09-10 and is excluded. Doc truth-up applied: status addenda
+  added to `reliability.md` (same pattern as the 2026-09-10 addendum from #19).
 
 ## Claimed-shipped facts verified clean (no drift)
 
@@ -35,9 +36,9 @@ Consult status headers vs code, all confirmed at exact lines:
   (`:1129-1147`) — matches consult §security boundary and AGENTS.md.
 - README↔code: all 10 documented commands exist in the dispatch
   (`:2028-2038`); the undocumented-looking `pin` is documented at README:106.
-- `tests/run-tests.sh` ShellChecks both wrapper (`:174`) and generated helper
-  (`:191`, `:556`); wrapper direct-execution guard exists (`auckland-vpn:747`)
-  — matches test-architecture consult.
+- `tests/run-tests.sh` ShellChecks the wrapper (`:174`), generated helper
+  (`:191`), and generated installer (`:556`); wrapper direct-execution guard
+  exists (`auckland-vpn:747`) — matches test-architecture consult.
 
 ## Blind spots closed this wave
 

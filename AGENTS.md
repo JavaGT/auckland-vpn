@@ -47,3 +47,6 @@ openconnect audit).
 - Inline automation route policies embed a `verified_at`/`stale_after` window
   that can be stale by run time (#54). Before dispatching, re-verify the exact
   `--agent`/`--model` pairs against `~/.config/opencode/MODEL-ROUTING.md`.
+- In zsh, quote `echo` separators (`echo "=== done ==="`): bare `===` triggers
+  `=cmd`/glob expansion and aborts the whole command chain. The bash-guard hook
+  covers ZCode Bash calls only — opencode2 child sessions are unguarded (#57).

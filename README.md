@@ -248,6 +248,9 @@ Run it locally (no sudo needed):
 tests/run-tests.sh          # requires bash + shellcheck (brew install shellcheck)
 ```
 
+Focused iteration: `tests/run-tests.sh <substring>...` runs only the tests
+whose names match (e.g. `tests/run-tests.sh monitor`).
+
 CI runs exactly that script on a GitHub Actions macOS runner (see
 `.github/workflows/tests.yml`) — no root, no network access. What is **not**
 automated and stays manual-only:

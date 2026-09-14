@@ -244,6 +244,26 @@ test_config_rejects_internal_whitespace() {
   assert_contains "$output" 'unsupported characters'
 }
 
+test_env_username_rejected() {
+  local box output status
+  box="$(new_sandbox env-username)"
+  output="$(HOME="$box/home" XDG_STATE_HOME="$box/state" VPN_USER='alice bob' bash -c 'source "$1"' _ "$CLI" 2>&1)"
+  status=$?
+  [ "$status" -ne 0 ] || fail 'invalid env username was accepted'
+  assert_contains "$output" 'unsupported characters'
+}
+
+test_setup_prompt_rejects_invalid_username() {
+  local box output status
+  box="$(new_sandbox setup-username)"
+  output="$(HOME="$box/home" XDG_STATE_HOME="$box/state" VPN_USER='' \
+    bash -c 'source "$1"; printf "alice bob\n" | cmd_setup' _ "$CLI" 2>&1)"
+  status=$?
+  [ "$status" -ne 0 ] || fail 'setup accepted an invalid username'
+  assert_contains "$output" 'unsupported username'
+  [ ! -e "$box/home/.config/auckland-vpn/config" ] || fail 'invalid username was saved to the config file'
+}
+
 test_attempt_log_scopes_latest_banner() {
   local box output
   box="$(new_sandbox attempt-log)"
@@ -885,6 +905,8 @@ tests=(
   test_config_rejects_shell_code
   test_config_rejects_conflicting_users
   test_config_rejects_internal_whitespace
+  test_env_username_rejected
+  test_setup_prompt_rejects_invalid_username
   test_attempt_log_scopes_latest_banner
   test_tunnel_ip_from_log
   test_privileged_command_contract

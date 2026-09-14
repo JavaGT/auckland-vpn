@@ -41,6 +41,12 @@ and `VPN_USER=<username>` lines are accepted — anything else is rejected with
 an error naming the file and line. (`setup` will offer to write the username
 there for you if it isn't set yet.)
 
+The username value itself is limited to letters, digits, and `@ . _ -` — no
+spaces. Surrounding whitespace is trimmed, and one pair of matching quotes
+(`"..."` or `'...'`) is stripped. The same rule applies wherever the username
+comes from: the config file, the `VPN_USER` environment variable, and the
+`setup` prompt.
+
 ## One-time setup
 
 1. **Install the script** (no sudo needed — use your Homebrew prefix:

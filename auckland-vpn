@@ -84,6 +84,17 @@ VPN_HOST="connectvpn.auckland.ac.nz"
 VPN_SERVER="connectvpn.auckland.ac.nz/client"   # includes the "client" realm
 VPN_PROTO="fortinet"
 
+# Usernames are restricted to a fixed class so one value is safe in every
+# downstream context (config lines, the helper bake, openconnect --user).
+# Every ingestion point — config file, VPN_USER env var, setup prompt — must
+# route through this.
+username_is_valid() {
+  case "$1" in
+    *[!A-Za-z0-9@._-]*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
 # Parse the optional config file WITHOUT executing it as shell code (the old
 # `. "$CONFIG_FILE"` ran arbitrary content on every invocation). Accepted:
 # blank lines, #comments, and 'VPN_USER=<username>' with optional matching
@@ -115,7 +126,7 @@ load_config() {
     if [ -z "$trimmed" ]; then
       die "$CONFIG_FILE:$n: VPN_USER has an empty value."
     fi
-    if [[ "$trimmed" != *[!A-Za-z0-9@._-]* ]]; then :; else
+    if ! username_is_valid "$trimmed"; then
       die "$CONFIG_FILE:$n: VPN_USER contains unsupported characters (allowed: letters, digits, @ . _ -)."
     fi
     if [ -n "${VPN_USER:-}" ] && [ "$VPN_USER" != "$trimmed" ]; then
@@ -205,6 +216,9 @@ require_prereqs() {
 # die() exists so a malformed config can fail loudly. Never executes config
 # content as shell code.
 VPN_USER="${VPN_USER:-}"
+if [ -n "$VPN_USER" ] && ! username_is_valid "$VPN_USER"; then
+  die "VPN_USER (from the environment) contains unsupported characters (allowed: letters, digits, @ . _ -)."
+fi
 load_config
 
 # True when the installed openconnect supports --pid-file (v8+). The helper
@@ -1017,6 +1031,9 @@ cmd_setup() {
     VPN_USER="${VPN_USER#"${VPN_USER%%[![:space:]]*}"}"
     VPN_USER="${VPN_USER%"${VPN_USER##*[![:space:]]}"}"
     [ -n "$VPN_USER" ] || die "no username entered; aborted."
+    if ! username_is_valid "$VPN_USER"; then
+      die "unsupported username '$VPN_USER' (allowed: letters, digits, @ . _ -); aborted."
+    fi
     save_vpn_user_to_config
     echo "Saved VPN_USER=$VPN_USER to $CONFIG_FILE"
     echo

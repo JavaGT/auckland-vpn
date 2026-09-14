@@ -42,10 +42,12 @@ an error naming the file and line. (`setup` will offer to write the username
 there for you if it isn't set yet.)
 
 The username value itself is limited to letters, digits, and `@ . _ -` — no
-spaces. Surrounding whitespace is trimmed, and one pair of matching quotes
-(`"..."` or `'...'`) is stripped. The same rule applies wherever the username
-comes from: the config file, the `VPN_USER` environment variable, and the
-`setup` prompt.
+spaces or quotes. The same rule is enforced wherever the username comes from,
+with small parsing differences by source: the config file trims surrounding
+whitespace and strips one pair of matching quotes (`"..."` or `'...'`); the
+`setup` prompt trims whitespace but accepts no quotes; the `VPN_USER`
+environment variable is used verbatim. Two conflicting `VPN_USER` lines in
+the config file are also rejected.
 
 ## One-time setup
 

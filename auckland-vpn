@@ -115,7 +115,7 @@ load_config() {
     if [ -z "$trimmed" ]; then
       die "$CONFIG_FILE:$n: VPN_USER has an empty value."
     fi
-    if [[ "$trimmed" != *[![:space:]A-Za-z0-9@._-]* ]]; then :; else
+    if [[ "$trimmed" != *[!A-Za-z0-9@._-]* ]]; then :; else
       die "$CONFIG_FILE:$n: VPN_USER contains unsupported characters (allowed: letters, digits, @ . _ -)."
     fi
     if [ -n "${VPN_USER:-}" ] && [ "$VPN_USER" != "$trimmed" ]; then

@@ -233,6 +233,17 @@ test_config_rejects_conflicting_users() {
   assert_contains "$output" 'duplicate conflicting VPN_USER lines'
 }
 
+test_config_rejects_internal_whitespace() {
+  local box output status
+  box="$(new_sandbox config-whitespace)"
+  mkdir -p "$box/home/.config/auckland-vpn"
+  printf 'VPN_USER=alice bob\n' >"$box/home/.config/auckland-vpn/config"
+  output="$(HOME="$box/home" XDG_STATE_HOME="$box/state" VPN_USER='' bash -c 'source "$1"' _ "$CLI" 2>&1)"
+  status=$?
+  [ "$status" -ne 0 ] || fail 'username with internal space was accepted'
+  assert_contains "$output" 'unsupported characters'
+}
+
 test_attempt_log_scopes_latest_banner() {
   local box output
   box="$(new_sandbox attempt-log)"
@@ -873,6 +884,7 @@ tests=(
   test_static_generated_helper
   test_config_rejects_shell_code
   test_config_rejects_conflicting_users
+  test_config_rejects_internal_whitespace
   test_attempt_log_scopes_latest_banner
   test_tunnel_ip_from_log
   test_privileged_command_contract

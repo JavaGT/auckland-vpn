@@ -302,6 +302,21 @@ last_log_error() {
   return 0
 }
 
+# The one known inert world-writable PATH ancestor: Apple ships
+# /System/Volumes/Preboot/Cryptexes as root:wheel 777, and SIP makes it
+# unwritable even to root, so the mode bit is not an attack surface there
+# (hostile review of 9f5aefc, issue #69). Intentionally narrow — the path
+# must sit under the Cryptexes tree AND be root:wheel-owned — so the list
+# stays at exactly one entry. Returns 0 = skip (exempt). Wrapper-side:
+# used only by cmd_doctor's PATH-hygiene advisory.
+path_hygiene_sip_exempt() {
+  case "$1" in
+    /System/Volumes/Preboot/Cryptexes|/System/Volumes/Preboot/Cryptexes/*) ;;
+    *) return 1 ;;
+  esac
+  [ "$2" = "0:0" ] || return 1
+}
+
 # Just the CURRENT attempt's log text (everything after the most recent
 # '==== auckland-vpn start' banner). Verification/status must not be fooled
 # by connected-markers from a PREVIOUS successful attempt still sitting in
@@ -1914,11 +1929,14 @@ cmd_doctor() {
   # PATH hygiene (issue #69) — advisory WARNs, never a FIX: several tools are
   # still resolved through the inherited PATH, so a group- or world-writable
   # directory anywhere in an entry's ancestor chain would let another local
-  # user plant a trojaned tool where the wrapper picks it up. Same rules as
-  # path_is_trusted (other-write always bad; group-write only tolerable for
-  # the admin group, gid 80) but reported, not enforced — hardening the
-  # unqualified calls themselves is #55's separate lane.
-  local entry p pmode pgid t finding hops shown=0 warn_total=0
+  # user plant a trojaned tool where the wrapper picks it up. Same write-bit
+  # rules as path_is_trusted (other-write always bad; group-write only
+  # tolerable for the admin group, gid 80; ownership deliberately NOT checked
+  # — only writability matters for PATH resolution) but reported, not
+  # enforced — hardening the unqualified calls themselves is #55's lane.
+  # One known inert ancestor is exempt: Apple's SIP-protected Cryptexes dir
+  # (root:wheel 777, unwritable even to root — see path_hygiene_sip_exempt).
+  local entry p pmode pgid pown rn t finding hops shown=0 warn_total=0 excluded=0
   if [ -n "${PATH:-}" ]; then
     while IFS= read -r entry; do
       if [ -z "$entry" ]; then
@@ -1936,7 +1954,18 @@ cmd_doctor() {
         pmode="$(/usr/bin/stat -f '%Lp' "$p" 2>/dev/null)" || break
         finding=""
         case "$pmode" in
-          *[2367]) finding="world-writable component: $p (mode $pmode)" ;;
+          *[2367])
+            pown="$(/usr/bin/stat -f '%u:%g' "$p" 2>/dev/null)" || break
+            # canonical spelling: symlink targets can carry ../ (the stock
+            # cryptex PATH entry does), and both the exemption and the
+            # report should name the real path
+            rn="$(cd -- "$p" 2>/dev/null && /bin/pwd -P)" || rn="$p"
+            if path_hygiene_sip_exempt "$rn" "$pown"; then
+              excluded=$((excluded + 1))
+            else
+              finding="world-writable component: $rn (mode $pmode)"
+            fi
+            ;;
           *[2367]?)
             pgid="$(/usr/bin/stat -f '%g' "$p" 2>/dev/null)" || break
             [ "$pgid" = "80" ] || finding="group-writable component: $p (mode $pmode, group not admin)"
@@ -1963,6 +1992,9 @@ cmd_doctor() {
         p="$(/usr/bin/dirname "$p")"
       done
     done < <(printf '%s\n' "$PATH" | tr ':' '\n')
+    if [ "$excluded" -gt 0 ]; then
+      echo "INFO PATH hygiene: $excluded Apple SIP-protected component(s) skipped (root:wheel under /System/Volumes/Preboot/Cryptexes)"
+    fi
     if [ "$warn_total" -eq 0 ]; then
       echo "OK   PATH hygiene: no group/world-writable component on any PATH entry"
     elif [ "$warn_total" -gt "$shown" ]; then

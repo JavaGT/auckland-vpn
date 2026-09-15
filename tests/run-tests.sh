@@ -830,6 +830,27 @@ test_doctor_warns_on_writable_path_entries() {
   PATH="$base:"
   out="$(cmd_doctor 2>&1 || true)"
   assert_contains "$out" 'empty entry (means the current directory)'
+  # Apple's SIP-protected Cryptexes dir is root:wheel 777 but unwritable even
+  # to root — the one inert ancestor must NOT warn (review of 9f5aefc). The
+  # sandbox cannot create /System paths, so exercise the helper directly.
+  path_hygiene_sip_exempt "/System/Volumes/Preboot/Cryptexes" "0:0" \
+    || fail 'exempt: Cryptexes itself, root:wheel, should be skipped'
+  path_hygiene_sip_exempt "/System/Volumes/Preboot/Cryptexes/App" "0:0" \
+    || fail 'exempt: under-Cryptexes root:wheel should be skipped'
+  path_hygiene_sip_exempt "/Users/someone/.local" "501:20" \
+    && fail 'exempt: user-owned world-writable dir must not be skipped'
+  path_hygiene_sip_exempt "/System/Volumes/Preboot/Cryptexes" "501:20" \
+    && fail 'exempt: non-root-owned Cryptexes must not be skipped'
+  path_hygiene_sip_exempt "/tmp/evil/System/Volumes/Preboot/Cryptexes" "0:0" \
+    && fail 'exempt: lookalike path outside /System must not be skipped'
+  # a PATH entry reached through a ../-spelled symlink reports the REAL
+  # normalised path, not the ..-littered spelling (review N3)
+  mkdir -p "$box/sub" "$box/target777/bin"
+  chmod 777 "$box/target777"
+  ln -s "../target777/bin" "$box/sub/entry"
+  PATH="$base:$box/sub/entry"
+  out="$(cmd_doctor 2>&1 || true)"
+  assert_contains "$out" "world-writable component: $box/target777"
 }
 
 # diagnose (issue #15) classifies failure classes from sandbox log fixtures.

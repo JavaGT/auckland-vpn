@@ -61,5 +61,5 @@ else met the bar of real friction, and none was manufactured.
 | [#17](https://github.com/JavaGT/auckland-vpn/issues/17) | Journal not discoverable from repo | Strong | config-review lane (AGENTS.md) |
 
 Cross-reference: #17 links back to this report
-(`docs/reports/2026-09-10-pain-journal.md`). Open at report time: #1
+(`artifacts/reports/2026-09-10/2026-09-10-pain-journal.md`, moved from `docs/reports/` in #58). Open at report time: #1
 (openfortivpn performance — unrelated, not touched). No tickets were closed.

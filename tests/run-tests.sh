@@ -803,6 +803,35 @@ test_doctor_reports_monitor_status() {
   assert_contains "$out" 'INFO monitor last recorded state: degraded'
 }
 
+# doctor warns (advisory WARN, never a FIX) on world-writable PATH ancestors
+# and reports a clean PATH. PATH is pinned because the check reads the live
+# environment — the suite must not depend on this machine's real PATH state
+# (issue #35 hermeticity).
+test_doctor_warns_on_writable_path_entries() {
+  local box out
+  box="$(new_sandbox doctor-path)"
+  source_cli "$box"
+  configure_generated_helper "$box"
+  local base="/usr/bin:/bin" safe="$box/path-safe/bin" evil="$box/path-evil/bin"
+  mkdir -p "$safe" "$evil"
+  chmod 755 "$box/path-safe" "$box/path-evil"
+  # world-writable ancestor of a PATH entry -> WARN, and no OK line
+  chmod 777 "$box/path-evil"
+  PATH="$base:$evil"
+  out="$(cmd_doctor 2>&1 || true)"
+  assert_contains "$out" 'world-writable component'
+  assert_not_contains "$out" 'OK   PATH hygiene'
+  # repairing the ancestor clears the warning
+  chmod 755 "$box/path-evil"
+  PATH="$base:$safe:$evil"
+  out="$(cmd_doctor 2>&1 || true)"
+  assert_contains "$out" 'OK   PATH hygiene'
+  # an empty PATH entry (means the current directory) is warned about too
+  PATH="$base:"
+  out="$(cmd_doctor 2>&1 || true)"
+  assert_contains "$out" 'empty entry (means the current directory)'
+}
+
 # diagnose (issue #15) classifies failure classes from sandbox log fixtures.
 test_diagnose_failure_classes() {
   local box out status
@@ -921,6 +950,7 @@ tests=(
   test_monitor_state_machine_transitions
   test_monitor_once_dead_fixture_dry_run
   test_doctor_reports_monitor_status
+  test_doctor_warns_on_writable_path_entries
   test_diagnose_failure_classes
   test_wrapper_seams_are_wrapper_only
   test_tests_dir_promoted_and_ci_runnable

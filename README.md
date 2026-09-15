@@ -96,6 +96,8 @@ auckland-vpn stop       # disconnect
 auckland-vpn restart    # stop, wait out the old process, start again (a
                         # survivor makes the start refuse rather than race)
 auckland-vpn doctor     # check every prerequisite; OK/FIX + exact fix each
+                        # (+ advisory WARNs for group/world-writable PATH
+                        # components — never counted as failures)
 auckland-vpn monitor    # optional watchdog that auto-heals a dead tunnel
                         # (foreground; see "Auto-heal monitor" below)
 auckland-vpn diagnose   # doctor checks + failure analysis of the last attempt

@@ -1835,7 +1835,8 @@ cmd_pin() {
 
 # One command that names everything broken, with the exact fix for each.
 # Prints one line per check — "OK <thing>" or "FIX <thing> — <exact
-# command>" — and exits non-zero when anything needs fixing. Read-only except
+# command>" — plus advisory "WARN"/"INFO" lines that never affect the exit
+# code — and exits non-zero when anything needs fixing. Read-only except
 # for a throwaway write test in the state dir; never prompts for sudo.
 cmd_doctor() {
   local fixes=0 last_err
@@ -1908,6 +1909,65 @@ cmd_doctor() {
     fi
   else
     echo "INFO no log yet ($LOG_FILE) — re-run 'auckland-vpn setup-sudo' if the helper is installed."
+  fi
+
+  # PATH hygiene (issue #69) — advisory WARNs, never a FIX: several tools are
+  # still resolved through the inherited PATH, so a group- or world-writable
+  # directory anywhere in an entry's ancestor chain would let another local
+  # user plant a trojaned tool where the wrapper picks it up. Same rules as
+  # path_is_trusted (other-write always bad; group-write only tolerable for
+  # the admin group, gid 80) but reported, not enforced — hardening the
+  # unqualified calls themselves is #55's separate lane.
+  local entry p pmode pgid t finding hops shown=0 warn_total=0
+  if [ -n "${PATH:-}" ]; then
+    while IFS= read -r entry; do
+      if [ -z "$entry" ]; then
+        warn_total=$((warn_total + 1))
+        if [ "$shown" -lt 5 ]; then
+          shown=$((shown + 1))
+          echo "WARN  PATH contains an empty entry (means the current directory) — remove it from PATH"
+        fi
+        continue
+      fi
+      p="$entry"
+      hops=0
+      while :; do
+        [ -e "$p" ] || break
+        pmode="$(/usr/bin/stat -f '%Lp' "$p" 2>/dev/null)" || break
+        finding=""
+        case "$pmode" in
+          *[2367]) finding="world-writable component: $p (mode $pmode)" ;;
+          *[2367]?)
+            pgid="$(/usr/bin/stat -f '%g' "$p" 2>/dev/null)" || break
+            [ "$pgid" = "80" ] || finding="group-writable component: $p (mode $pmode, group not admin)"
+            ;;
+        esac
+        if [ -n "$finding" ]; then
+          warn_total=$((warn_total + 1))
+          if [ "$shown" -lt 5 ]; then
+            shown=$((shown + 1))
+            echo "WARN  PATH entry $entry has a $finding"
+          fi
+        fi
+        if [ -L "$p" ]; then                       # keep checking via the link target
+          hops=$((hops + 1))
+          [ "$hops" -gt 16 ] && break               # symlink loop / absurd chain
+          t="$(/usr/bin/readlink "$p")"
+          case "$t" in
+            /*) p="$t" ;;
+            *)  p="$(/usr/bin/dirname "$p")/$t" ;;
+          esac
+          continue
+        fi
+        [ "$p" != "/" ] || break
+        p="$(/usr/bin/dirname "$p")"
+      done
+    done < <(printf '%s\n' "$PATH" | tr ':' '\n')
+    if [ "$warn_total" -eq 0 ]; then
+      echo "OK   PATH hygiene: no group/world-writable component on any PATH entry"
+    elif [ "$warn_total" -gt "$shown" ]; then
+      echo "INFO PATH hygiene: $warn_total findings on PATH; showing the first $shown"
+    fi
   fi
 
   # Monitor status — informational only, never a FIX: is a monitor process

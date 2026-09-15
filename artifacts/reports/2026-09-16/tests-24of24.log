@@ -1,0 +1,26 @@
+ok - test_static_wrapper
+ok - test_static_generated_helper
+ok - test_config_rejects_shell_code
+ok - test_config_rejects_conflicting_users
+ok - test_config_rejects_internal_whitespace
+ok - test_env_username_rejected
+ok - test_setup_prompt_rejects_invalid_username
+ok - test_attempt_log_scopes_latest_banner
+ok - test_tunnel_ip_from_log
+ok - test_privileged_command_contract
+ok - test_start_success_with_stub_openconnect
+ok - test_start_auth_failure_with_stub_openconnect
+ok - test_helper_two_record_stdin_and_token_file
+ok - test_concurrent_start_refused_by_lock
+ok - test_sigterm_mid_operation_exits_cleanly
+ok - test_stale_lock_takeover
+ok - test_installer_takes_paths_as_parameters
+ok - test_stop_timeout_reports_honestly_without_sigkill
+ok - test_monitor_state_machine_transitions
+ok - test_monitor_once_dead_fixture_dry_run
+ok - test_doctor_reports_monitor_status
+ok - test_diagnose_failure_classes
+ok - test_wrapper_seams_are_wrapper_only
+ok - test_tests_dir_promoted_and_ci_runnable
+
+24 passed, 0 failed (24 of 24 tests selected)

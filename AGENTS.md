@@ -39,9 +39,14 @@ openconnect audit).
   AGENTS.md holds constraints, README holds what the tool does.
 - Prior automation findings live in-repo under `artifacts/reports/<YYYY-MM-DD>/`
   (every wave; the 2026-09-10 wave was consolidated there from its old
-  `docs/reports/` location in #58) plus `artifacts/automation-receipts/`.
+  `docs/reports/` location in #58), review verdicts under `artifacts/reviews/`,
+  plus `artifacts/automation-receipts/`.
   Check these and the open `[quick-scan]` / `[config-review]` tracker issues
   before re-deriving a known finding.
+- Scheduled one-shot follow-ups: closing an issue unloads its follow-up
+  (bootout the LaunchAgent, delete the script) — a stale fire for a closed
+  issue wastes a dispatch on a dead agent id and can re-close settled work
+  (#73, incident 2026-09-17).
 - Long reads: the Read tool can garble or interleave lines on large file
   slices (seen 2026-09-11). Re-verify any candidate finding from a long read
   with `sed`/`grep` at the exact lines before ticketing or editing it.

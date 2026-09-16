@@ -17,7 +17,7 @@ additionally reproduced live in /tmp sandboxes (no repo mutations).
 (auckland-vpn:1969-1972, gid-80 filter, raw `$p` reporting). The committed
 suite exercises only the world-writable branch, the empty-entry WARN, the
 exemption helper directly, and a world-writable `../`-symlink case
-(tests/run-tests.sh:810-869, test_doctor_warns_on_writable_path_entries);
+(tests/run-tests.sh:810-854, test_doctor_warns_on_writable_path_entries);
 `grep 'group-writable|775|gid|:80' tests/run-tests.sh` finds nothing. The
 branch works (verified live: a mode-775 gid-0 ancestor produces
 `WARN  PATH entry ... group-writable component: ... (mode 775, group not admin)`)
@@ -43,7 +43,7 @@ There is only one line in the file; the message names a nonexistent second
 config line and, unlike every sibling message, does not say where the other
 value came from. Behavior (conflict is fatal rather than env-wins) seems right
 and is arguably safest, but it is untested
-(test_config_rejects_conflicting_users, tests/run-tests.sh:225-236, passes
+(test_config_rejects_conflicting_users, tests/run-tests.sh:225-234, passes
 `VPN_USER=''`; test_env_username_rejected:247-255 only covers invalid chars)
 and undocumented — README.md:48-50 describes only "Two conflicting VPN_USER
 lines in the config file". Fix shape: distinguish the message
@@ -78,7 +78,7 @@ README.md:98-100 describes the doctor advisory WARNs as covering
 "group/world-writable PATH components" only; the same commit (9f5aefc) also
 added the empty-PATH-entry WARN (auckland-vpn:1942-1948), which is a different
 class and is not mentioned. One-line README touch-up whenever doctor output is
-next edited.
+next edited. RESOLVED 2026-09-17: shipped in 8ad4105 (README doctor line now lists empty PATH entries).
 
 ## Verified clean (investigated, no ticket)
 
@@ -88,7 +88,7 @@ next edited.
   INFO line at :1995-1997. Matches the review artifact's claims.
 - Write-bit rules match `path_is_trusted` as the comment claims (other-write
   always bad, group-write only gid 80; ownership deliberately unchecked) —
-  confirmed against path_is_trusted at auckland-vpn:564-592.
+  confirmed against path_is_trusted at auckland-vpn:564-589.
 - Mode-glob correctness: `%Lp` yields 3-digit modes on this macOS (verified:
   755, 777); `*[2367]` / `*[2367]?)` branch selection is correct, with
   world-write intentionally shadowing group-write (world-write implies it).

@@ -100,7 +100,7 @@ hostile-review verdicts land in `artifacts/reviews/` (exists,
 2026-09-15-0930-45-hostile.md, 2026-09-15-1000-63-hostile.md; cited as
 evidence by the 2026-09-15 receipts). An agent following AGENTS.md navigation
 misses prior review verdicts. Fix: one-line AGENTS.md edit adding
-`artifacts/reviews/`.
+`artifacts/reviews/`. RESOLVED 2026-09-17: shipped in 8ad4105.
 
 ### F4 — Speculative: MODEL-ROUTING.md route table duplicates a route
 
@@ -117,7 +117,7 @@ derived check's spec can name row-dedup explicitly.
 - README command/flag list matches the script exactly: dispatch case
   auckland-vpn:2137-2149 (setup, setup-sudo, start, stop, restart, status,
   monitor, log, pin, doctor, diagnose, help; bare/unknown -> usage, exit 2),
-  usage text auckland-vpn:2102-2133; `log -f` (:999), `monitor --once`
+  usage text auckland-vpn:2102-2129; `log -f` (:999), `monitor --once`
   (:1786-1787), `--reconnect-timeout=300` (:684); all 12 monitor env knobs
   present; second `usage()` at :509 belongs to the generated helper
   ("auckland-vpn helper" die prefix), not a drift.

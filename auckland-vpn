@@ -2076,7 +2076,7 @@ cmd_diagnose() {
   if grep -q "Got login realm 'client'" <<<"$attempt"; then
     echo "REALM:     ok — \"Got login realm 'client'\" present."
   else
-    echo "REALM:     WARNING — \"Got login realm 'client'\" NOT found. If connecting also failed, investigate the realm/URL path before blaming credentials (docs/consults/openconnect-audit.md §1)."
+    echo "REALM:     WARNING — \"Got login realm 'client'\" NOT found. If connecting also failed, investigate the realm/URL path before blaming credentials: the /client URL path only becomes realm 'client' if the gateway redirects to a URL containing realm=client (audit §1)."
   fi
 
   # DNS application classes (audit §5).

@@ -18,7 +18,7 @@
 - Coordinator spot-checks before ticketing: sed at every cited site; own sudo probe (one-argv rc=1, two-operand rc=0); walk-shape re-verification for #85; #90-vs-quick-scan "clean" discrepancy resolved (different pipefail trigger classes, both real) and recorded on #90.
 - Tickets created: #84 (config-review codification, implemented this wave, left open for the same review round as #83/#82 per the codified rule), #85-#91 (evidence-backed, fix shapes in bodies; #86/#88 framed evaluate-whether-worth-doing). No ticket closed.
 - No implementation child admitted for #87/#89/#90/#91 this wave: hostile-review seat is dead (provider balance), and per the just-codified rule implemented behavior changes would stack onto the un-reviewed backlog; fix shapes are ticket-ready for the next implementation wave.
-- Commit: ef6e4d0 (AGENTS.md + 3 reports + this receipt; worktree clean after).
+- Commit: 1c29c42 (AGENTS.md + 3 reports + this receipt; this SHA-stamp line is the only follow-up commit).
 
 ## Incomplete work
 

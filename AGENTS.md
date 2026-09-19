@@ -3,7 +3,9 @@
 Bash wrapper around `openconnect --protocol=fortinet` for the University of
 Auckland VPN: openconnect generates the TOTP code itself, reconnects
 automatically, and DNS is handled by the Homebrew `vpnc-script`. Installed as
-`/opt/homebrew/bin/auckland-vpn`.
+`/opt/homebrew/bin/auckland-vpn` (that installed copy is a stale pre-hardening
+build — verify behaviour against the repo script, not the installed binary;
+remove this caveat when the #33 redeploy lands).
 
 ## Design decisions that look wrong but are deliberate
 
@@ -43,6 +45,11 @@ openconnect audit).
   plus `artifacts/automation-receipts/`.
   Check these and the open `[quick-scan]` / `[config-review]` tracker issues
   before re-deriving a known finding.
+- Implemented wave work keeps its tracker ticket open until the hostile review
+  verdict is reconciled: close on APPROVED; route FIX-FIRST fixes back to the
+  ticket. A review deferred by a dispatch blocker leaves an exact next action
+  in the wave report and the receipt's `next_action` (practice since the
+  2026-09-19 catch-up wave; codified 2026-09-20).
 - Scheduled one-shot follow-ups: closing an issue unloads its follow-up
   (bootout the LaunchAgent, delete the script) — a stale fire for a closed
   issue wastes a dispatch on a dead agent id and can re-close settled work

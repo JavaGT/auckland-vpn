@@ -63,7 +63,9 @@ set -euo pipefail
 recdir="$(cd "$(dirname "$0")" && pwd)"
 if [ "${1:-}" = "--help" ]; then
   echo 'usage: openconnect --pid-file=FILE'
-  exit 0
+  # Faithful to the real binary, which exits 1 after help (#83): a stub
+  # exiting 0 hides pipefail poisoning of the --pid-file capability probe.
+  exit 1
 fi
 STUB
   printf 'OC_STUB_MODE=%q\n' "$mode" >>"$path"
@@ -291,6 +293,19 @@ Connected as 172.19.8.7, using SSL
 LOG
   output="$(tunnel_ip_from_log)"
   [ "$output" = '172.19.8.7' ] || fail "unexpected tunnel IP: $output"
+}
+
+test_helper_bakes_pid_support_despite_help_exit_1() {
+  # Real openconnect exits 1 after printing --help (origin 2b9e90f, #83);
+  # under pipefail the probe must still report support, or setup aborts and
+  # setup-sudo bakes OC_HAS_PID_FILE=0 into the helper.
+  local box helper
+  box="$(new_sandbox pidfile-probe)"
+  make_openconnect_stub "$box/bin/openconnect"
+  source_cli "$box"
+  configure_generated_helper "$box"
+  helper="$(generate_helper)"
+  assert_contains "$helper" 'OC_HAS_PID_FILE=1'
 }
 
 test_privileged_command_contract() {
@@ -960,6 +975,7 @@ tests=(
   test_attempt_log_scopes_latest_banner
   test_tunnel_ip_from_log
   test_privileged_command_contract
+  test_helper_bakes_pid_support_despite_help_exit_1
   test_start_success_with_stub_openconnect
   test_start_auth_failure_with_stub_openconnect
   test_helper_two_record_stdin_and_token_file

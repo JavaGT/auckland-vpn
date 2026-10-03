@@ -2,6 +2,16 @@
 
 [![tests](https://github.com/JavaGT/auckland-vpn/actions/workflows/tests.yml/badge.svg)](https://github.com/JavaGT/auckland-vpn/actions/workflows/tests.yml)
 
+## Install
+
+```bash
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/JavaGT/auckland-vpn/main/install.sh)"
+```
+
+This installs Homebrew if needed, then `openconnect` and `auckland-vpn`.
+Continue with one-time setup step 2 below. To install from a local checkout,
+run `./install.sh` there instead.
+
 This replaces your flakey manual command:
 
 ```
@@ -51,8 +61,9 @@ the config file are also rejected.
 
 ## One-time setup
 
-1. **Install the script** (no sudo needed — use your Homebrew prefix:
-   `/opt/homebrew` on Apple Silicon, `/usr/local` on Intel):
+1. **Install the script** — use the one-liner above, or install manually
+   (no sudo needed — use your Homebrew prefix: `/opt/homebrew` on Apple
+   Silicon, `/usr/local` on Intel):
 
    ```bash
    cp auckland-vpn /opt/homebrew/bin/auckland-vpn   # /usr/local/bin/... on Intel
@@ -102,6 +113,7 @@ auckland-vpn doctor     # check every prerequisite; OK/FIX + exact fix each
 auckland-vpn monitor    # optional watchdog that auto-heals a dead tunnel
                         # (foreground; see "Auto-heal monitor" below)
 auckland-vpn diagnose   # doctor checks + failure analysis of the last attempt
+auckland-vpn update     # self-update to the latest version from GitHub
 ```
 
 Running bare `auckland-vpn` (or an unknown command) shows help and exits 2 —
@@ -168,6 +180,9 @@ inspect it, but pinning is not used.
   the vpnc-script (`/private/etc/auckland-vpn/vpnc-script`) that setup-sudo
   stages from Homebrew — so an old helper keeps writing to old locations and
   running an old vpnc-script until regenerated.
+- `auckland-vpn update` downloads the latest script from GitHub, checks its
+  Bash syntax, then replaces the installed copy. Re-run `setup-sudo` after
+  updating so the privileged helper picks up the current settings.
 - **Sudo behaviour of `start`:** `start` needs the privileged helper that
   `setup-sudo` installs — without it, it exits with that exact instruction.
   Once installed, connecting is passwordless; if the helper exists but its

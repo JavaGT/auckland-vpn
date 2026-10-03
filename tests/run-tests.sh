@@ -266,6 +266,41 @@ test_setup_prompt_rejects_invalid_username() {
   [ ! -e "$box/home/.config/auckland-vpn/config" ] || fail 'invalid username was saved to the config file'
 }
 
+test_update_syntax_checked_before_install() {
+  local box target output status
+  box="$(new_sandbox update-syntax)"
+  source_cli "$box"
+  target="$box/bin/auckland-vpn"
+  printf '#!/usr/bin/env bash\n# old version\n' >"$target"
+  chmod +x "$target"
+  cat >"$box/bin/curl" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "-o" ]; then shift; break; fi
+  shift
+done
+case "${PAYLOAD_MODE:-valid}" in
+  invalid) printf 'if true; then\n' >"$1" ;;
+  valid) printf '#!/usr/bin/env bash\n# updated version\n' >"$1" ;;
+esac
+STUB
+  chmod +x "$box/bin/curl"
+  export PATH="$box/bin:$PATH"
+
+  output="$(PAYLOAD_MODE=invalid cmd_update 2>&1)"
+  status=$?
+  [ "$status" -ne 0 ] || fail 'update installed a syntax-invalid download'
+  assert_contains "$output" 'downloaded script failed syntax check'
+  grep -qF '# old version' "$target" || fail 'invalid download replaced the installed script'
+
+  output="$(PAYLOAD_MODE=valid cmd_update 2>&1)"
+  status=$?
+  [ "$status" -eq 0 ] || fail "update rejected valid script: $output"
+  assert_contains "$output" 'Updated '
+  grep -qF '# updated version' "$target" || fail 'valid downloaded script was not installed'
+}
+
 test_attempt_log_scopes_latest_banner() {
   local box output
   box="$(new_sandbox attempt-log)"
@@ -1591,6 +1626,7 @@ tests=(
   test_config_rejects_internal_whitespace
   test_env_username_rejected
   test_setup_prompt_rejects_invalid_username
+  test_update_syntax_checked_before_install
   test_attempt_log_scopes_latest_banner
   test_tunnel_ip_from_log
   test_privileged_command_contract

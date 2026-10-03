@@ -156,6 +156,12 @@ inspect it, but pinning is not used.
 - **One tunnel at a time**: starting while already connected is refused —
   use `auckland-vpn restart`, which waits out the old process first; if it
   somehow survived, the start half refuses rather than racing it.
+- **Stale privileged operation locks fail closed.** If the helper is killed
+  while starting or stopping, a later operation may report a stale or corrupt
+  lock under `/private/etc/auckland-vpn/operation.lock`. First verify no
+  `auckland-vpn` helper operation is running; then inspect and remove that
+  lock directory as root before retrying. The helper never reclaims it
+  automatically because competing cleanup can allow two operations to run.
 - **After upgrading this tool, or after `brew upgrade openconnect`, re-run
   `auckland-vpn setup-sudo`.** The privileged helper embeds the log path and
   other settings at install time, and it uses its own root-owned **copy** of

@@ -540,11 +540,8 @@ test_sigterm_mid_operation_exits_cleanly() {
   [ -z "$tokfile" ] || fail "SIGTERM left the token temp file behind: $tokfile"
 }
 
-# Stale-lock takeover: a leftover lock dir must be recoverable WITHOUT ever
-# deleting a possibly-live lock on sight. A dead-holder marker is taken over
-# immediately (and logged); an EMPTY marker is waited out (~2s of retries,
-# the mkdir→write-pid window) before an abandoned-lock takeover.
-test_stale_lock_takeover() {
+# Stale operation locks fail closed to avoid concurrent replacement-lock races.
+test_stale_lock_refusal_preserves_marker() {
   local box out status dead_pid
   box="$(new_sandbox stale-lock)"
   make_openconnect_stub "$box/bin/openconnect"
@@ -553,29 +550,29 @@ test_stale_lock_takeover() {
   export PATH="$box/bin:$PATH"
   export SUDO_UID="$(id -u)" SUDO_GID="$(id -g)"
 
-  # Scenario 1: marker names a provably DEAD holder -> immediate takeover.
+  # A dead holder is reported; its lock and marker stay intact.
   true & dead_pid=$!
   wait "$dead_pid" 2>/dev/null || true
   mkdir "$HELPER_DIR/operation.lock"
   printf '%s\n' "$dead_pid" >"$HELPER_DIR/operation.lock/pid"
   out="$(printf '%s\n%s\n' pass tok | "$HELPER_BIN" start 2>&1)"
   status=$?
-  [ "$status" -eq 0 ] || fail "start did not take over a dead-holder lock: $out"
-  assert_contains "$out" 'is dead — taking over the stale lock'
-  [ ! -e "$HELPER_DIR/operation.lock" ] || fail 'lock leaked after successful start'
-  env -i PATH=/usr/bin:/bin SUDO_UID="$(id -u)" SUDO_GID="$(id -g)" \
-    "$HELPER_BIN" stop >/dev/null 2>&1 || true
+  [ "$status" -ne 0 ] || fail 'start reclaimed a dead-holder lock automatically'
+  assert_contains "$out" 'names dead pid'
+  [ -f "$HELPER_DIR/operation.lock/pid" ] || fail 'dead-holder marker was removed'
+  [ "$(cat "$HELPER_DIR/operation.lock/pid")" = "$dead_pid" ] || fail 'dead-holder marker changed'
+  rm -f "$HELPER_DIR/operation.lock/pid"
+  rmdir "$HELPER_DIR/operation.lock"
 
   # Scenario 2: EMPTY marker (an owner may sit in its mkdir→write-pid
-  # window): never removed on sight; takeover only after the retry grace.
+  # window): after a short grace, refuse and preserve the empty marker.
   mkdir "$HELPER_DIR/operation.lock"
   out="$(printf '%s\n%s\n' pass tok | "$HELPER_BIN" start 2>&1)"
   status=$?
-  [ "$status" -eq 0 ] || fail "start did not take over an abandoned empty lock: $out"
-  assert_contains "$out" 'still empty after grace'
-  [ ! -e "$HELPER_DIR/operation.lock" ] || fail 'lock leaked after successful start'
-  env -i PATH=/usr/bin:/bin SUDO_UID="$(id -u)" SUDO_GID="$(id -g)" \
-    "$HELPER_BIN" stop >/dev/null 2>&1 || true
+  [ "$status" -ne 0 ] || fail 'start reclaimed an empty lock automatically'
+  assert_contains "$out" 'cannot acquire operation lock'
+  [ -d "$HELPER_DIR/operation.lock" ] || fail 'empty lock directory was removed'
+  [ ! -s "$HELPER_DIR/operation.lock/pid" ] || fail 'empty lock marker changed'
 }
 
 # Installer quoting regression: site values must travel as POSITIONAL
@@ -924,6 +921,628 @@ test_wrapper_seams_are_wrapper_only() {
     || { fail "unexpected seam defaults: $defaulted"; return 1; }
 }
 
+# Sol hardening wave (2026-10-03): setup-sudo must refuse an
+# environment-overridden helper destination before generating anything or
+# touching sudo — baking the AUCKLAND_VPN_HELPER_BIN seam into the persistent
+# root NOPASSWD grant would authorise an attacker-chosen binary as root.
+test_setup_sudo_rejects_helper_override() {
+  local box out status
+  box="$(new_sandbox setup-sudo-override)"
+  make_openconnect_stub "$box/bin/openconnect"
+  source_cli "$box"
+  configure_generated_helper "$box"
+  # Sentinel sudo: ANY invocation records itself — refusal must precede it.
+  cat >"$box/bin/sudo" <<STUB
+#!/usr/bin/env bash
+printf 'CALLED\n' >"$box/SUDO_CALLED"
+exit 0
+STUB
+  chmod +x "$box/bin/sudo"
+  export PATH="$box/bin:$PATH"
+  out="$(AUCKLAND_VPN_HELPER_BIN="$box/evil-helper" cmd_setup_sudo 2>&1)"
+  status=$?
+  [ "$status" -ne 0 ] || fail 'setup-sudo accepted an overridden helper path'
+  assert_contains "$out" 'setup-sudo requires the canonical helper path'
+  [ ! -e "$box/SUDO_CALLED" ] || fail 'refused setup-sudo still invoked sudo'
+}
+
+# Sol hardening wave: the helper's trust walk must validate the ancestors
+# holding a symlink, not just the resolved target — a writable directory
+# containing the link could otherwise swap the binary under root.
+test_helper_rejects_writable_symlink_ancestor() {
+  local box out status
+  box="$(new_sandbox helper-symlink)"
+  make_openconnect_stub "$box/bin/openconnect"
+  source_cli "$box"
+  configure_generated_helper "$box"
+  export PATH="$box/bin:$PATH"
+  export SUDO_UID="$(id -u)" SUDO_GID="$(id -g)"
+  mkdir -p "$box/linkdir"
+  ln -s "$box/bin/openconnect" "$box/linkdir/oc-link"
+  chmod 777 "$box/linkdir"
+  OPENCONNECT_BIN="$box/linkdir/oc-link"
+  generate_helper >"$HELPER_BIN"
+  out="$(printf '%s\n%s\n' pass tok | "$HELPER_BIN" start 2>&1)"
+  status=$?
+  [ "$status" -ne 0 ] || fail 'helper start through a writable link-holder was not refused'
+  assert_contains "$out" 'not root-trusted'
+  [ "$(pgrep -f "$box/bin/openconnect" | wc -l | tr -d ' ')" = "0" ] \
+    || fail 'refused start still launched openconnect'
+  # The same target through a trustworthy holder still starts.
+  chmod 755 "$box/linkdir"
+  out="$(printf '%s\n%s\n' pass tok | "$HELPER_BIN" start 2>&1)" \
+    || fail "safe link chain refused: $out"
+  env -i PATH=/usr/bin:/bin SUDO_UID="$(id -u)" SUDO_GID="$(id -g)" \
+    "$HELPER_BIN" stop >/dev/null 2>&1 || true
+}
+
+# Sol hostile re-review: an intermediate ancestor symlink must not launder a
+# writable holder — safe/alias -> writable-holder/target passes the literal
+# ancestors (leaf, bin, alias, safe) while the writable holder only appears
+# on the RESOLVED target chain. The trust walk must refuse it.
+test_helper_rejects_writable_symlink_target_ancestor() {
+  local box out status
+  box="$(new_sandbox helper-symlink-ancestor)"
+  mkdir -p "$box/writable-holder/target/bin"
+  make_openconnect_stub "$box/writable-holder/target/bin/openconnect"
+  source_cli "$box"
+  configure_generated_helper "$box"
+  export SUDO_UID="$(id -u)" SUDO_GID="$(id -g)"
+  mkdir -p "$box/safe"
+  ln -s "$box/writable-holder/target" "$box/safe/alias"
+  chmod 777 "$box/writable-holder"
+  OPENCONNECT_BIN="$box/safe/alias/bin/openconnect"
+  generate_helper >"$HELPER_BIN"
+  out="$(printf '%s\n%s\n' pass tok | "$HELPER_BIN" start 2>&1)"
+  status=$?
+  [ "$status" -ne 0 ] || fail 'helper start through a writable symlinked ancestor was not refused'
+  assert_contains "$out" 'not root-trusted'
+  [ "$(pgrep -f "$box/safe/alias" | wc -l | tr -d ' ')" = "0" ] \
+    || fail 'refused start still launched openconnect'
+  # Repairing the holder admits the same chain: fail-closed, not fail-broken.
+  chmod 755 "$box/writable-holder"
+  out="$(printf '%s\n%s\n' pass tok | "$HELPER_BIN" start 2>&1)" \
+    || fail "safe symlinked-ancestor chain refused: $out"
+  env -i PATH=/usr/bin:/bin SUDO_UID="$(id -u)" SUDO_GID="$(id -g)" \
+    "$HELPER_BIN" stop >/dev/null 2>&1 || true
+}
+
+# Sol hostile re-review: cyclic or dangling symlinks on the trusted path must
+# fail closed immediately (hop budget / existence gate), never hang root or
+# resolve to something launchable.
+test_helper_trust_walk_cycle_fails_closed() {
+  local box out status
+  box="$(new_sandbox helper-symlink-cycle)"
+  make_openconnect_stub "$box/bin/openconnect"
+  source_cli "$box"
+  configure_generated_helper "$box"
+  export SUDO_UID="$(id -u)" SUDO_GID="$(id -g)"
+  mkdir -p "$box/loop"
+  ln -s a "$box/loop/b"
+  ln -s b "$box/loop/a"
+  OPENCONNECT_BIN="$box/loop/a/bin/openconnect"
+  generate_helper >"$HELPER_BIN"
+  out="$(printf '%s\n%s\n' pass tok | "$HELPER_BIN" start 2>&1)"
+  status=$?
+  [ "$status" -ne 0 ] || fail 'cyclic symlink chain was accepted'
+  assert_contains "$out" 'not root-trusted'
+  # Dangling leaf link: same fail-closed refusal.
+  ln -s "$box/does-not-exist" "$box/loop/dangling"
+  OPENCONNECT_BIN="$box/loop/dangling"
+  generate_helper >"$HELPER_BIN"
+  out="$(printf '%s\n%s\n' pass tok | "$HELPER_BIN" start 2>&1)"
+  status=$?
+  [ "$status" -ne 0 ] || fail 'dangling symlink was accepted'
+  assert_contains "$out" 'not root-trusted'
+}
+
+# Sol hardening wave: doctor's PATH walk has the same link-holder shape —
+# it must report the writable directory holding the link, not just the
+# (clean) target chain.
+test_doctor_checks_link_parent() {
+  local box out
+  box="$(new_sandbox doctor-linkparent)"
+  make_openconnect_stub "$box/bin/openconnect"
+  source_cli "$box"
+  configure_generated_helper "$box"
+  mkdir -p "$box/holder" "$box/real/bin"
+  ln -s "$box/real/bin" "$box/holder/entry"
+  chmod 777 "$box/holder"
+  PATH="/usr/bin:/bin:$box/holder/entry"
+  out="$(cmd_doctor 2>&1 || true)"
+  assert_contains "$out" 'world-writable component'
+  assert_contains "$out" "$box/holder"
+  assert_not_contains "$out" 'OK   PATH hygiene'
+}
+
+# Sol hostile re-review: a CLEAN symlink object whose TARGET is world-writable
+# must not read as OK — keying the walk's seen-set by pwd -P marked the link's
+# target as validated before anything checked it.
+test_doctor_warns_on_writable_symlink_target() {
+  local box out
+  box="$(new_sandbox doctor-linktarget)"
+  make_openconnect_stub "$box/bin/openconnect"
+  source_cli "$box"
+  configure_generated_helper "$box"
+  mkdir -p "$box/real"
+  chmod 777 "$box/real"
+  ln -s "$box/real" "$box/entry"   # clean link object -> world-writable target
+  PATH="/usr/bin:/bin:$box/entry"
+  out="$(cmd_doctor 2>&1 || true)"
+  assert_contains "$out" 'world-writable component'
+  assert_contains "$out" "$box/real"
+  assert_not_contains "$out" 'OK   PATH hygiene'
+  # Repairing the target clears the warning: the link itself stays clean.
+  chmod 755 "$box/real"
+  out="$(cmd_doctor 2>&1 || true)"
+  assert_contains "$out" 'OK   PATH hygiene'
+}
+
+# Sol hardening wave: connected-marker checks must not SIGPIPE the attempt
+# producer — with an attempt larger than the pipe buffer, the old
+# `attempt_log | grep -q` pipeline failed the writer and misreported a
+# connected tunnel as failed under pipefail. A previous attempt's marker
+# alone must still not verify.
+test_large_attempt_marker_is_pipefail_safe() {
+  local box out daemon size
+  box="$(new_sandbox sigpipe-attempt)"
+  make_openconnect_stub "$box/bin/openconnect"
+  source_cli "$box"
+  configure_generated_helper "$box"
+  {
+    printf '==== auckland-vpn start now ====\n'
+    awk 'BEGIN { for (i = 0; i < 3000; i++) print "padding log line", i, "0123456789abcdef" }'
+    printf 'Connected as 10.9.9.9, using SSL\n'
+  } >"$LOG_FILE"
+  size="$(wc -c <"$LOG_FILE" | tr -d ' ')"
+  [ "$size" -gt 65536 ] || fail "fixture did not exceed the pipe buffer ($size bytes)"
+  # The daemon argv names openconnect AND our host: running_vpn_pid's
+  # recorded-PID branch demands the server identity (recycled-PID guard).
+  "$box/bin/openconnect" --stub-daemon "$VPN_SERVER" >/dev/null 2>&1 &
+  daemon=$!
+  printf '%s\n' "$daemon" >"$PID_FILE"
+  verify_tunnel_started >/dev/null 2>&1 \
+    || fail 'large current attempt with a connected marker did not verify'
+  out="$(cmd_status 2>&1)"
+  assert_contains "$out" 'Connected as'
+  kill "$daemon" 2>/dev/null || true
+  wait "$daemon" 2>/dev/null || true
+  {
+    printf '==== auckland-vpn start old ====\nConnected as 10.0.0.1\n'
+    printf '==== auckland-vpn start new ====\nStill connecting...\n'
+  } >"$LOG_FILE"
+  "$box/bin/openconnect" --stub-daemon "$VPN_SERVER" >/dev/null 2>&1 &
+  daemon=$!
+  printf '%s\n' "$daemon" >"$PID_FILE"
+  out="$(cmd_status 2>&1)"
+  assert_contains "$out" 'Connecting...'
+  kill "$daemon" 2>/dev/null || true
+  wait "$daemon" 2>/dev/null || true
+
+  # A stale PID plus a fresh connection marker is not proof of a live tunnel.
+  printf '==== auckland-vpn start stale ===\nConnected as 10.9.9.9, using SSL\n' >"$LOG_FILE"
+  printf '99999999\n' >"$PID_FILE"
+  sleep() { :; }  # make the 30-poll negative path immediate
+  if verify_tunnel_started >/dev/null 2>&1; then
+    unset -f sleep
+    fail 'startup verification accepted a connected marker with no live matching PID'
+  fi
+  unset -f sleep
+}
+
+# Sol hardening wave: doctor must probe sudo authorisation with the helper
+# path and action as SEPARATE operands — the old single-string
+# `sudo -n -l "helper start"` probe could never match a real sudoers rule,
+# so healthy installs always reported FIX. Passwordlessness is claimed only
+# when both detailed listings report no authentication requirement.
+test_doctor_helper_authorization_contract() {
+  local box out status
+  box="$(new_sandbox doctor-authz)"
+  make_openconnect_stub "$box/bin/openconnect"
+  source_cli "$box"
+  configure_generated_helper "$box"
+  cat >"$box/bin/sudo" <<STUB
+#!/usr/bin/env bash
+printf '%s|' "\$@" >>"$box/SUDO_ARGV"
+printf '\n' >>"$box/SUDO_ARGV"
+if [ "\$#" -eq 4 ] && [ "\$1" = "-n" ] && [ "\$2" = "-ll" ] && [ "\$3" = "$HELPER_BIN" ]; then
+  case "\$4" in
+    start|stop)
+      if [ "\${DENY:-}" = "1" ]; then exit 1; fi
+      printf 'User %s may run the following commands:\n    Options: !authenticate\n    (root) %s %s\n' "\$(whoami)" "\$3" "\$4"
+      exit 0
+      ;;
+  esac
+fi
+exit 1
+STUB
+  chmod +x "$box/bin/sudo"
+  export PATH="$box/bin:$PATH"
+  out="$(cmd_doctor 2>&1)"
+  status=$?
+  [ "$status" -eq 0 ] || fail "doctor failed on a permitted install: $out"
+  assert_contains "$out" 'passwordless sudo allows it'
+  grep -qF -- "-n|-ll|$HELPER_BIN|start" "$box/SUDO_ARGV" \
+    || fail "doctor did not probe start with split operands: $(cat "$box/SUDO_ARGV")"
+  grep -qF -- "-n|-ll|$HELPER_BIN|stop" "$box/SUDO_ARGV" \
+    || fail "doctor did not probe stop with split operands: $(cat "$box/SUDO_ARGV")"
+  out="$(DENY=1 cmd_doctor 2>&1)"
+  status=$?
+  [ "$status" -ne 0 ] || fail 'doctor reported OK for a denied install'
+  assert_contains "$out" 'sudoers does not allow it'
+}
+
+# Sol hardening wave: under the helper operation lock, a second sequential
+# start while the recorded tunnel is still live must refuse — otherwise it
+# truncates the pidfile and launches a second client beside the first.
+test_helper_sequential_start_refused() {
+  local box out status daemon_pid daemon_count
+  box="$(new_sandbox helper-sequential)"
+  make_openconnect_stub "$box/bin/openconnect"
+  source_cli "$box"
+  configure_generated_helper "$box"
+  export PATH="$box/bin:$PATH"
+  export SUDO_UID="$(id -u)" SUDO_GID="$(id -g)"
+  printf '%s\n%s\n' pass tok | "$HELPER_BIN" start >/dev/null 2>&1 \
+    || fail 'first helper start failed'
+  daemon_pid="$(cat "$PID_FILE")"
+  out="$(printf '%s\n%s\n' pass tok | "$HELPER_BIN" start 2>&1)"
+  status=$?
+  [ "$status" -ne 0 ] || fail 'second sequential start was not refused'
+  assert_contains "$out" 'already connected/starting'
+  [ "$(cat "$PID_FILE")" = "$daemon_pid" ] \
+    || fail 'refused start mutated the pidfile'
+  daemon_count="$(pgrep -f "$box/bin/openconnect" | wc -l | tr -d ' ')"
+  [ "$daemon_count" = "1" ] || fail "expected exactly 1 tunnel process, got $daemon_count"
+  env -i PATH=/usr/bin:/bin SUDO_UID="$(id -u)" SUDO_GID="$(id -g)" \
+    "$HELPER_BIN" stop >/dev/null 2>&1 || true
+}
+
+# Sol hostile re-review: running_vpn_pid's recorded-PID branch must demand
+# OUR host in the process command line — a recycled PID holding some other
+# server's openconnect client is not this tunnel (spawned via a script file
+# so the harness's own argv can never match the scoped pgrep).
+test_running_vpn_pid_requires_server_identity() {
+  local box pid_foreign pid_suffix pid_ours
+  box="$(new_sandbox vpn-pid-identity)"
+  make_openconnect_stub "$box/bin/openconnect"
+  source_cli "$box"
+  configure_generated_helper "$box"
+  "$box/bin/openconnect" --stub-daemon vpn.other.example/client >/dev/null 2>&1 &
+  pid_foreign=$!
+  printf '%s\n' "$pid_foreign" >"$PID_FILE"
+  [ -z "$(running_vpn_pid || true)" ] \
+    || fail 'running_vpn_pid accepted a foreign-server client as ours'
+  kill "$pid_foreign" 2>/dev/null || true
+  wait "$pid_foreign" 2>/dev/null || true
+  "$box/bin/openconnect" --stub-daemon "${VPN_SERVER}-other" >/dev/null 2>&1 &
+  pid_suffix=$!
+  printf '%s\n' "$pid_suffix" >"$PID_FILE"
+  [ -z "$(running_vpn_pid || true)" ] \
+    || fail 'running_vpn_pid accepted a server name with a suffix'
+  kill "$pid_suffix" 2>/dev/null || true
+  wait "$pid_suffix" 2>/dev/null || true
+  "$box/bin/openconnect" --stub-daemon "$VPN_SERVER" >/dev/null 2>&1 &
+  pid_ours=$!
+  printf '%s\n' "$pid_ours" >"$PID_FILE"
+  [ "$(running_vpn_pid || true)" = "$pid_ours" ] \
+    || fail "running_vpn_pid did not recognise our own recorded client: $(ps -p "$pid_ours" -o command= 2>/dev/null)"
+  kill "$pid_foreign" "$pid_suffix" "$pid_ours" 2>/dev/null || true
+  wait "$pid_foreign" 2>/dev/null || true
+  wait "$pid_suffix" 2>/dev/null || true
+  wait "$pid_ours" 2>/dev/null || true
+  : >"$PID_FILE"
+}
+
+# Sol hostile re-review: a live FOREIGN-server openconnect recorded in the
+# pidfile must not suppress the heal — the old already-running skip called
+# running_vpn_pid's loose openconnect-only branch, so a recycled PID running
+# another server's client blocked the legitimate Auckland restart forever.
+test_heal_restarts_despite_foreign_server_client() {
+  local box out status foreign
+  box="$(new_sandbox heal-foreign-client)"
+  make_openconnect_stub "$box/bin/openconnect"
+  source_cli "$box"
+  configure_generated_helper "$box"
+  notify_user() { return 0; }
+  monitor_network_ready() { return 0; }   # reach the launch phase
+  verify_tunnel_started() { return 0; }   # this test asserts launch admission, not openconnect startup
+  cat >"$box/bin/sudo" <<STUB
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >>"$box/SUDO_CALLS"
+exit 0
+STUB
+  chmod +x "$box/bin/sudo"
+  export PATH="$box/bin:$PATH"
+  touch "$STATE_DIR/monitor.enabled"   # intent up: a heal is wanted
+  cat >"$box/spawn-foreign" <<'SPAWN'
+#!/usr/bin/env bash
+exec -a 'openconnect --protocol=fortinet vpn.other.example/client' sleep 30
+SPAWN
+  chmod +x "$box/spawn-foreign"
+  "$box/spawn-foreign" >/dev/null 2>&1 &
+  foreign=$!
+  printf '%s\n' "$foreign" >"$PID_FILE"
+  printf '==== auckland-vpn start now ====\nConnected as 10.9.9.9, using SSL\n' >"$LOG_FILE"
+  out="$(monitor_heal 2>&1)"
+  status=$?
+  kill "$foreign" 2>/dev/null || true
+  wait "$foreign" 2>/dev/null || true
+  [ "$status" -eq 0 ] || fail "heal failed with a foreign client recorded: $out"
+  case "$out" in
+    *already*running*) fail 'heal skipped for a FOREIGN-server client: '"$out" ;;
+  esac
+  grep -qw start "$box/SUDO_CALLS" \
+    || fail "foreign client suppressed the heal restart: $(cat "$box/SUDO_CALLS")"
+  grep -q 'heal=recovered' "$MONITOR_LOG" \
+    || fail "heal did not complete: $out"
+}
+
+# Sol hardening wave: a user stop that lands mid-heal (credential lookup or
+# the stop/start gap) clears the intent file — the launch phase must
+# recheck it immediately before starting, or the monitor resurrects a tunnel
+# the user just killed.
+test_stop_cancels_inflight_heal() {
+  local box out status
+  box="$(new_sandbox heal-cancel)"
+  make_openconnect_stub "$box/bin/openconnect"
+  source_cli "$box"
+  configure_generated_helper "$box"
+  monitor_network_ready() { return 0; }   # reach the launch phase
+  cat >"$box/bin/sudo" <<STUB
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >>"$box/SUDO_CALLS"
+exit 0
+STUB
+  chmod +x "$box/bin/sudo"
+  export PATH="$box/bin:$PATH"
+  : >"$PID_FILE"   # nothing running: the heal stop phase is a no-op success
+  rm -f "$STATE_DIR/monitor.enabled"   # ...but intent is down: stop won the race
+  out="$(monitor_heal 2>&1)"
+  status=$?
+  [ "$status" -eq 0 ] || fail "cancelled heal did not exit 0: $out"
+  assert_contains "$out" 'intent-down'
+  grep -qw start "$box/SUDO_CALLS" \
+    && fail "cancelled heal still issued a helper start: $(cat "$box/SUDO_CALLS")"
+  grep -q 'heal=cancelled reason=intent-down' "$MONITOR_LOG" \
+    || fail 'cancel was not logged'
+}
+
+# Sol hardening wave: cmd_stop must serialize with the final heal launch. Hold
+# the fake helper at start after the monitor has acquired intent.lock, request
+# a stop, and verify that stop cannot finish until the start completes. It
+# then runs after that start and leaves intent down with no live tunnel.
+test_stop_serializes_with_heal_launch() {
+  local box out status healer stopper i
+  box="$(new_sandbox heal-stop-serialization)"
+  make_openconnect_stub "$box/bin/openconnect"
+  source_cli "$box"
+  configure_generated_helper "$box"
+  monitor_network_ready() { return 0; }
+  verify_tunnel_started() { return 0; }
+  notify_user() { return 0; }
+  cat >"$box/bin/sudo" <<STUB
+#!/usr/bin/env bash
+set -euo pipefail
+export SUDO_UID="$(id -u)" SUDO_GID="$(id -g)"
+if [ "\${1:-}" = "-n" ]; then shift; fi
+action="\${2:-}"
+printf '%s\n' "\$action" >>"$box/SUDO_ACTIONS"
+if [ "\$action" = start ]; then
+  : >"$box/START_ENTERED"
+  while [ ! -e "$box/RELEASE_START" ]; do sleep 0.05; done
+fi
+exec "\$@"
+STUB
+  chmod +x "$box/bin/sudo"
+  SUDO_BIN="$box/bin/sudo"
+  export PATH="$box/bin:$PATH"
+  touch "$MONITOR_ENABLED_FILE"
+
+  ( monitor_heal >"$box/heal.out" 2>&1 ) &
+  healer=$!
+  for i in $(seq 1 100); do
+    [ -e "$box/START_ENTERED" ] && break
+    sleep 0.05
+  done
+  [ -e "$box/START_ENTERED" ] || {
+    kill "$healer" 2>/dev/null || true
+    fail 'heal never reached its controlled helper-start window'
+    return 1
+  }
+
+  ( cmd_stop >"$box/stop.out" 2>&1 ) &
+  stopper=$!
+  sleep 0.25
+  if ! kill -0 "$stopper" 2>/dev/null; then
+    : >"$box/RELEASE_START"
+    wait "$healer" 2>/dev/null || true
+    wait "$stopper" 2>/dev/null || true
+    fail 'cmd_stop returned while the heal start still held the intent lock'
+    return 1
+  fi
+
+  : >"$box/RELEASE_START"
+  wait "$healer" || { out="$(cat "$box/heal.out")"; fail "heal failed: $out"; }
+  wait "$stopper" || { out="$(cat "$box/stop.out")"; fail "stop failed: $out"; }
+  [ ! -e "$MONITOR_ENABLED_FILE" ] || fail 'stop left VPN intent enabled'
+  [ -z "$(running_vpn_pid || true)" ] || fail 'tunnel remained live after serialized stop'
+  [ "$(tr '\n' ' ' <"$box/SUDO_ACTIONS" | sed 's/[[:space:]]*$//')" = 'stop start stop' ] \
+    || fail "expected heal-stop, heal-start, user-stop order; got: $(cat "$box/SUDO_ACTIONS")"
+}
+
+# A fresh install may not have created per-user state yet. `stop` is still an
+# idempotent user command, so it must create that directory before acquiring
+# the new lifecycle lock.
+test_stop_creates_state_dir_before_lock() {
+  local box out
+  box="$(new_sandbox stop-without-state)"
+  make_openconnect_stub "$box/bin/openconnect"
+  source_cli "$box"
+  configure_generated_helper "$box"
+  rmdir "$STATE_DIR"
+  out="$(cmd_stop 2>&1)" || fail "stop failed before state existed: $out"
+  [ -d "$STATE_DIR" ] || fail 'stop did not create its state directory'
+  assert_contains "$out" 'Not connected.'
+}
+
+# Automatic stale-lock removal has a two-reclaimer race: a contender can
+# delete a live replacement lock after both observed the old dead PID. Fail
+# closed and preserve the marker so recovery is deliberate and reviewable.
+test_intent_lock_stale_marker_is_preserved() {
+  local box out status
+  box="$(new_sandbox intent-stale-lock)"
+  source_cli "$box"
+  configure_generated_helper "$box"
+  mkdir "$INTENT_LOCK_DIR"
+  printf '99999999\n' >"$INTENT_LOCK_DIR/pid"
+  out="$(intent_lock_acquire 2>&1)"
+  status=$?
+  [ "$status" -ne 0 ] || fail 'stale intent lock was silently reclaimed'
+  assert_contains "$out" 'has a stale PID'
+  [ "$(cat "$INTENT_LOCK_DIR/pid")" = '99999999' ] \
+    || fail 'stale-lock refusal modified the existing marker'
+}
+
+# Sol hardening wave: an expired breaker must admit exactly one half-open
+# probe — a further failure re-opens the circuit, while health clears it
+# through the normal two-pass threshold.
+test_monitor_circuit_half_open() {
+  local box now r i
+  box="$(new_sandbox circuit-halfopen)"
+  export MAX_RESTART_ATTEMPTS=3 CIRCUIT_COOLDOWN=3600 BACKOFF_CAP=900 \
+    NETWORK_SETTLE_GRACE=0 RECONNECT_GRACE=0 DEGRADED_GRACE=0 DEGRADED_THRESHOLD=2
+  source_cli "$box"
+  ensure_state_dir
+  # shellcheck disable=SC2034  # seeds for state_machine_step's globals
+  current_state=unknown bad_since=0 degraded_count=0 restart_attempts=0
+  # shellcheck disable=SC2034  # seeds for state_machine_step's globals
+  next_attempt=0 circuit_until=0 healthy_count=0
+  now=1000000
+  bad_since=$((now - 10000))   # pre-age: settle grace long elapsed
+  for i in 1 2 3; do
+    now=$((now + 10000))
+    state_machine_step dead "$now" >"$box/rec"
+    r="$(cat "$box/rec")"
+    case "$r" in
+      *action=WOULD_RESTART*) ;;
+      *) fail "attempt $i did not request a restart: $r"; return 1 ;;
+    esac
+  done
+  now=$((now + 10000))
+  state_machine_step dead "$now" >"$box/rec"
+  r="$(cat "$box/rec")"
+  case "$r" in
+    *state=circuit_open*action=notify*) ;;
+    *) fail "exhaustion did not open the circuit: $r"; return 1 ;;
+  esac
+  # Inside the cool-down: open, with no action to execute.
+  now=$((now + 100))
+  state_machine_step dead "$now" >"$box/rec"
+  r="$(cat "$box/rec")"
+  case "$r" in
+    *state=circuit_open*retry_at=*) ;;
+    *) fail "cool-down did not hold the circuit open: $r"; return 1 ;;
+  esac
+  case "$r" in
+    *action=*) fail "cool-down must emit no action: $r"; return 1 ;;
+  esac
+  # Past the cool-down: exactly one half-open probe restart...
+  now=$((circuit_until + 1))
+  state_machine_step dead "$now" >"$box/rec"
+  r="$(cat "$box/rec")"
+  case "$r" in
+    *action=WOULD_RESTART*) ;;
+    *) fail "expired circuit admitted no half-open probe: $r"; return 1 ;;
+  esac
+  # ...whose failure re-opens the circuit instead of granting a full budget.
+  now=$((now + 10000))
+  state_machine_step dead "$now" >"$box/rec"
+  r="$(cat "$box/rec")"
+  case "$r" in
+    *state=circuit_open*action=notify*) ;;
+    *) fail "failed probe did not reopen the circuit: $r"; return 1 ;;
+  esac
+  # And health after expiry clears the breaker through the normal threshold.
+  now=$((circuit_until + 1))
+  state_machine_step healthy "$now" >"$box/rec"
+  state_machine_step healthy "$now" >"$box/rec"
+  r="$(cat "$box/rec")"
+  case "$r" in
+    *state=healthy*) ;;
+    *) fail "health did not clear the circuit: $r"; return 1 ;;
+  esac
+  [ "$circuit_until" -eq 0 ] || fail 'healthy recovery left circuit_until set'
+}
+
+# Sol hardening wave: offline passes must defer WITHOUT spending the retry
+# budget or touching the helper; restored readiness admits an attempt that
+# is charged exactly once.
+test_monitor_network_deferral_preserves_budget() {
+  local box now rec i sleeper
+  box="$(new_sandbox network-deferral)"
+  export MAX_RESTART_ATTEMPTS=5 CIRCUIT_COOLDOWN=3600 BACKOFF_CAP=900 \
+    NETWORK_SETTLE_GRACE=0 RECONNECT_GRACE=0 DEGRADED_GRACE=0 DEGRADED_THRESHOLD=2
+  source_cli "$box"
+  configure_generated_helper "$box"
+  notify_user() { return 0; }   # silent fixture: no desktop popups from heals
+  monitor_network_ready() { return 1; }   # offline
+  verify_tunnel_started() { return 0; }   # keep the ready-path assertion focused on admission
+  cat >"$box/bin/sudo" <<STUB
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >>"$box/SUDO_CALLS"
+exit 0
+STUB
+  chmod +x "$box/bin/sudo"
+  export PATH="$box/bin:$PATH"
+  touch "$STATE_DIR/monitor.enabled"   # intent up: healing is wanted
+  : >"$PID_FILE"                        # dead tunnel fixture
+  # shellcheck disable=SC2034  # seeds for state_machine_step's globals
+  current_state=unknown bad_since=0 degraded_count=0 restart_attempts=0
+  # shellcheck disable=SC2034  # seeds for state_machine_step's globals
+  next_attempt=0 circuit_until=0 healthy_count=0
+  now="$(date +%s)"
+  bad_since=$((now - 10000))   # pre-age: settle grace long elapsed
+  # NOTE: monitor_act runs in the current shell (never $()), so the
+  # budget refund it performs stays visible to the assertions below.
+  for i in 1 2 3; do
+    now=$((now + 10000))
+    state_machine_step dead "$now" >"$box/rec"
+    rec="$(cat "$box/rec")"
+    case "$rec" in
+      *action=WOULD_RESTART*) ;;
+      *) fail "offline pass $i admitted no restart: $rec"; return 1 ;;
+    esac
+    monitor_act "$rec" || { fail "deferred act failed on pass $i"; return 1; }
+  done
+  [ "$restart_attempts" -eq 0 ] \
+    || fail "offline deferral consumed the budget (attempts=$restart_attempts)"
+  [ ! -e "$box/SUDO_CALLS" ] \
+    || fail "deferred heal invoked sudo: $(cat "$box/SUDO_CALLS")"
+  grep -q 'heal=deferred reason=network-not-ready' "$MONITOR_LOG" \
+    || fail 'deferral was not logged'
+  # Readiness restored: the next due attempt runs and is charged exactly once.
+  monitor_network_ready() { return 0; }
+  sleep 300 >/dev/null 2>&1 &
+  sleeper=$!
+  printf '%s\n' "$sleeper" >"$PID_FILE"
+  printf '==== auckland-vpn start now ====\nConnected as 10.9.9.9, using SSL\n' >>"$LOG_FILE"
+  now=$((now + 10000))
+  state_machine_step dead "$now" >"$box/rec"
+  rec="$(cat "$box/rec")"
+  case "$rec" in
+    *action=WOULD_RESTART*) ;;
+    *) fail "ready pass admitted no restart: $rec"; kill "$sleeper" 2>/dev/null; return 1 ;;
+  esac
+  monitor_act "$rec" || { fail 'admitted heal failed'; kill "$sleeper" 2>/dev/null; return 1; }
+  [ "$restart_attempts" -eq 1 ] \
+    || fail "expected exactly 1 charged attempt, got $restart_attempts"
+  grep -qw start "$box/SUDO_CALLS" \
+    || fail "ready heal issued no helper start: $(cat "$box/SUDO_CALLS")"
+  kill "$sleeper" 2>/dev/null || true
+  wait "$sleeper" 2>/dev/null || true
+}
+
 # Issue #16 promotion smoke: tests/ is the single suite location (no
 # prototype-suite copy, no symlink), directly executable, and CI runs exactly
 # this script on macOS.
@@ -981,7 +1600,7 @@ tests=(
   test_helper_two_record_stdin_and_token_file
   test_concurrent_start_refused_by_lock
   test_sigterm_mid_operation_exits_cleanly
-  test_stale_lock_takeover
+  test_stale_lock_refusal_preserves_marker
   test_installer_takes_paths_as_parameters
   test_stop_timeout_reports_honestly_without_sigkill
   test_monitor_state_machine_transitions
@@ -990,6 +1609,23 @@ tests=(
   test_doctor_warns_on_writable_path_entries
   test_diagnose_failure_classes
   test_wrapper_seams_are_wrapper_only
+  test_setup_sudo_rejects_helper_override
+  test_helper_rejects_writable_symlink_ancestor
+  test_helper_rejects_writable_symlink_target_ancestor
+  test_helper_trust_walk_cycle_fails_closed
+  test_doctor_checks_link_parent
+  test_doctor_warns_on_writable_symlink_target
+  test_large_attempt_marker_is_pipefail_safe
+  test_doctor_helper_authorization_contract
+  test_helper_sequential_start_refused
+  test_running_vpn_pid_requires_server_identity
+  test_heal_restarts_despite_foreign_server_client
+  test_stop_cancels_inflight_heal
+  test_stop_serializes_with_heal_launch
+  test_stop_creates_state_dir_before_lock
+  test_intent_lock_stale_marker_is_preserved
+  test_monitor_circuit_half_open
+  test_monitor_network_deferral_preserves_budget
   test_tests_dir_promoted_and_ci_runnable
 )
 

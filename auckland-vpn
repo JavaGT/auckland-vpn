@@ -10,9 +10,11 @@
 #     fallback if Keychain can't prompt in your current shell).
 #   * --reconnect-timeout keeps the tunnel auto-reconnecting if it drops
 #     (this build has no --persistent flag).
-#   * Certificate trust uses the system's trusted CAs (the gateway cert is from
-#     DigiCert). We deliberately do NOT pin a specific cert, because the
-#     university's gateway certificate rotates — pinning would just break later.
+#   * Certificate trust uses OpenConnect's default CA verification — for this
+#     Homebrew build, GnuTLS with the Mozilla root store (NOT the macOS
+#     Keychain; gateway cert is from DigiCert). We deliberately do NOT pin a
+#     specific cert, because the university's gateway certificate rotates —
+#     pinning would just break later.
 #   * The Homebrew vpnc-script (already installed) sets DNS correctly via
 #     scutil, which is the usual cause of "connected but nothing resolves".
 #
@@ -82,6 +84,17 @@ VPN_HOST="connectvpn.auckland.ac.nz"
 VPN_SERVER="connectvpn.auckland.ac.nz/client"   # includes the "client" realm
 VPN_PROTO="fortinet"
 
+# Usernames are restricted to a fixed class so one value is safe in every
+# downstream context (config lines, the helper bake, openconnect --user).
+# Every ingestion point — config file, VPN_USER env var, setup prompt — must
+# route through this.
+username_is_valid() {
+  case "$1" in
+    ""|*[!A-Za-z0-9@._-]*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
 # Parse the optional config file WITHOUT executing it as shell code (the old
 # `. "$CONFIG_FILE"` ran arbitrary content on every invocation). Accepted:
 # blank lines, #comments, and 'VPN_USER=<username>' with optional matching
@@ -113,7 +126,7 @@ load_config() {
     if [ -z "$trimmed" ]; then
       die "$CONFIG_FILE:$n: VPN_USER has an empty value."
     fi
-    if [[ "$trimmed" != *[![:space:]A-Za-z0-9@._-]* ]]; then :; else
+    if ! username_is_valid "$trimmed"; then
       die "$CONFIG_FILE:$n: VPN_USER contains unsupported characters (allowed: letters, digits, @ . _ -)."
     fi
     if [ -n "${VPN_USER:-}" ] && [ "$VPN_USER" != "$trimmed" ]; then
@@ -123,17 +136,56 @@ load_config() {
   done <"$CONFIG_FILE"
 }
 
-# Private per-user state (mode 700). Logs live here instead of /tmp, so they
-# survive reboots, are not world-readable, and keep history across attempts.
+# Private per-user state (mode 700). Holds non-secret diagnostics only
+# (keychain-error.txt); the VPN log lives in a root-owned directory (below).
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/auckland-vpn"
-LOG_FILE="$STATE_DIR/auckland-vpn.log"
-# Privileged helper + sudoers install targets (see cmd_setup_sudo). The
-# generated helper bakes LOG_FILE/PID_FILE in at setup-sudo time — after
-# changing paths or upgrading, re-run 'auckland-vpn setup-sudo'.
+# Privileged install targets (see cmd_setup_sudo). Everything under
+# HELPER_DIR/LOG_DIR is created and owned by ROOT during setup-sudo:
+#   * LOG_DIR is root:wheel 755; LOG_FILE is pre-created owned by YOU
+#     (CALLER_UID:CALLER_GID) mode 600. The helper only ever APPENDS via a
+#     validated descriptor — root never chowns/recreates the log at runtime.
+#   * PID_FILE stays root-owned mode 644 (the PID is not secret; the
+#     unprivileged wrapper only ever READS it).
+# The generated helper bakes these in at setup-sudo time — after changing
+# paths, upgrading this tool, or upgrading openconnect via Homebrew (the
+# staged vpnc-script copy is refreshed then too), re-run 'auckland-vpn
+# setup-sudo'.
 HELPER_DIR="/private/etc/auckland-vpn"
 HELPER_BIN="$HELPER_DIR/helper"
+STAGED_VPNC_SCRIPT="$HELPER_DIR/vpnc-script"
 PID_FILE="$HELPER_DIR/vpn.pid"
+LOG_DIR="/private/var/log/auckland-vpn"
+LOG_FILE="$LOG_DIR/auckland-vpn.log"
 SUDOERS_FILE="/etc/sudoers.d/auckland-vpn"
+
+# Test seams (wrapper-side ONLY; design: docs/consults/test-architecture.md).
+# An UNPRIVILEGED test driver may redirect which helper program the wrapper
+# asks sudo to run (AUCKLAND_VPN_HELPER_BIN) and which sudo binary performs
+# the asking (AUCKLAND_VPN_SUDO_BIN, absolute path). This is safe because the
+# installed sudoers rule authorises ONLY the exact installed absolute helper
+# with exactly 'start'/'stop': a fake HELPER_BIN is simply rejected by real
+# sudo, and a fake SUDO_BIN executes as the current user — power anyone who
+# controls this user's environment already has. Neither variable is ever
+# granted through sudo (the fragment carries NOSETENV) and NEITHER is ever
+# consulted by the generated privileged helper, which bakes all site values
+# in at generation time and must contain zero environment switches.
+SUDO_BIN="sudo"
+if [ "$(/usr/bin/id -u)" -ne 0 ]; then
+  if [ -n "${AUCKLAND_VPN_HELPER_BIN:-}" ]; then
+    HELPER_BIN="$AUCKLAND_VPN_HELPER_BIN"
+  fi
+  if [ -n "${AUCKLAND_VPN_SUDO_BIN:-}" ]; then
+    SUDO_BIN="$AUCKLAND_VPN_SUDO_BIN"
+  fi
+fi
+
+# Optional auto-heal monitor (issue #14; design: docs/consults/reliability.md).
+# All private per-user state alongside the rest of STATE_DIR.
+MONITOR_ENABLED_FILE="$STATE_DIR/monitor.enabled"   # presence == VPN wanted up
+MONITOR_STATE_FILE="$STATE_DIR/monitor-state"       # persisted counters
+MONITOR_LOCK_DIR="$STATE_DIR/monitor.lock"          # single-monitor lock
+MONITOR_LOG="$STATE_DIR/monitor.log"                # transition log
+INTENT_LOCK_DIR="$STATE_DIR/intent.lock"            # stop-vs-heal-launch mutex
 
 # ---- Helpers ----------------------------------------------------------------
 die() { echo "Error: $*" >&2; exit 1; }
@@ -165,14 +217,18 @@ require_prereqs() {
 # die() exists so a malformed config can fail loudly. Never executes config
 # content as shell code.
 VPN_USER="${VPN_USER:-}"
+if [ -n "$VPN_USER" ] && ! username_is_valid "$VPN_USER"; then
+  die "VPN_USER (from the environment) contains unsupported characters (allowed: letters, digits, @ . _ -)."
+fi
 load_config
 
 # True when the installed openconnect supports --pid-file (v8+). The helper
 # relies on it so 'stop' can kill an exact recorded PID instead of pkill.
 # NOTE: capture --help output first and grep it separately. A direct
 # 'openconnect --help | grep -q' pipe is broken under 'set -o pipefail'
-# because openconnect exits 1 after printing help — and grep -q's early
-# exit can also SIGPIPE the writer. Both made this check falsely fail.
+# because openconnect exits 1 after printing help (#83, ported from origin
+# 2b9e90f) — and grep -q's early exit can also SIGPIPE the writer. Both
+# made this check falsely fail and abort setup on a capable binary.
 openconnect_supports_pid_file() {
   [ -x "$OPENCONNECT_BIN" ] || return 1
   local help
@@ -229,20 +285,33 @@ write_secret_file() { # write_secret_file <path> <content>
 }
 
 # PID of a live openconnect for OUR host, else nothing. The pidfile is only
-# trusted when its recorded process really is openconnect (guards against PID
-# reuse); a missing/stale/corrupt/unreadable pidfile falls back to a scoped
-# pgrep. Detection only — actual killing goes through the helper (or the
-# scoped legacy pkill in cmd_stop), never through this.
+# trusted when its recorded process really is an openconnect for OUR host —
+# a bare 'openconnect' match would let a recycled PID holding some other
+# server's client pose as this tunnel (guards against PID reuse). A
+# missing/stale/corrupt/unreadable pidfile falls back to a scoped pgrep.
+# Detection only — actual killing goes through the helper (or the scoped
+# legacy pkill in cmd_stop), never through this.
 running_vpn_pid() {
-  local pid pids
+  local pid pids command candidate
   pid="$(cat "$PID_FILE" 2>/dev/null)" || true
-  if [[ "$pid" =~ ^[0-9]+$ ]] \
-      && ps -p "$pid" -o command= 2>/dev/null | grep -q openconnect; then
-    printf '%s\n' "$pid"
-    return 0
+  if [[ "$pid" =~ ^[0-9]+$ ]]; then
+    command="$(ps -p "$pid" -o command= 2>/dev/null)" || command=""
+    case "$command" in
+      *openconnect*"$VPN_SERVER")
+        printf '%s\n' "$pid"
+        return 0
+        ;;
+    esac
   fi
-  pids="$(pgrep -f "openconnect.*$VPN_HOST" 2>/dev/null)" || true
-  printf '%s\n' "${pids%%$'\n'*}"
+  pids="$(pgrep -f 'openconnect' 2>/dev/null)" || true
+  while IFS= read -r candidate; do
+    [[ "$candidate" =~ ^[0-9]+$ ]] || continue
+    command="$(ps -p "$candidate" -o command= 2>/dev/null)" || command=""
+    case "$command" in
+      *openconnect*"$VPN_SERVER") printf '%s\n' "$candidate"; return 0 ;;
+    esac
+  done <<<"$pids"
+  return 0
 }
 
 # Last error-looking line of the current log (empty when none or no log).
@@ -252,6 +321,21 @@ last_log_error() {
   hit="$(grep -iE 'error|failed|denied|refused|invalid' "$LOG_FILE" 2>/dev/null | tail -n 1)" || true
   [ -n "$hit" ] && printf '%s\n' "$hit"
   return 0
+}
+
+# The one known inert world-writable PATH ancestor: Apple ships
+# /System/Volumes/Preboot/Cryptexes as root:wheel 777, and SIP makes it
+# unwritable even to root, so the mode bit is not an attack surface there
+# (hostile review of 9f5aefc, issue #69). Intentionally narrow — the path
+# must sit under the Cryptexes tree AND be root:wheel-owned — so the list
+# stays at exactly one entry. Returns 0 = skip (exempt). Wrapper-side:
+# used only by cmd_doctor's PATH-hygiene advisory.
+path_hygiene_sip_exempt() {
+  case "$1" in
+    /System/Volumes/Preboot/Cryptexes|/System/Volumes/Preboot/Cryptexes/*) ;;
+    *) return 1 ;;
+  esac
+  [ "$2" = "0:0" ] || return 1
 }
 
 # Just the CURRENT attempt's log text (everything after the most recent
@@ -287,13 +371,20 @@ tunnel_ip_from_log() {
 # (a bare word like 'tunnel' proves nothing) — printing progress so the pause
 # doesn't feel hung.
 verify_tunnel_started() {
-  local waited=0
+  local waited=0 attempt pid
   printf 'verifying'
   while [ "$waited" -lt 30 ]; do
-    if [ -s "$PID_FILE" ] \
-        && attempt_log | grep -qiE 'connected as|established (dtls|tls)'; then
-      printf '\n'
-      return 0
+    # SIGPIPE-safe: capture the attempt first, then grep the captured text.
+    # A direct `attempt_log | grep -q` lets grep's early exit SIGPIPE the
+    # awk writer, which under `pipefail` misreports a connected tunnel as
+    # failed once the attempt exceeds the pipe buffer (~64KB).
+    pid="$(valid_vpn_pid || true)"
+    if [ -n "$pid" ]; then
+      attempt="$(attempt_log)" || attempt=""
+      if grep -qiE 'connected as|established (dtls|tls)' <<<"$attempt"; then
+        printf '\n'
+        return 0
+      fi
     fi
     sleep 0.5
     waited=$((waited + 1))
@@ -311,7 +402,7 @@ report_start_failure() {
     tail -n 15 "$LOG_FILE" 2>/dev/null || true
     echo "Connection failed. Full log: auckland-vpn log"
   else
-    echo "Connection failed — nothing was written to $LOG_FILE (cannot write log there?)."
+    echo "Connection failed — nothing was written to $LOG_FILE (re-run: auckland-vpn setup-sudo)."
   fi
   echo "(If sudo refused permission instead, re-run: auckland-vpn setup-sudo)"
   exit 1
@@ -327,10 +418,13 @@ refuse_if_already_running() {
   fi
 }
 
-# After stop, confirm the old process is REALLY gone before starting anew:
-# SIGTERM delivery is not process death, and launching beside a dying tunnel
-# means two clients fighting over utun/DNS/routes. Bounded ~10s, then one
-# escalation through the helper (whose stop path escalates to SIGKILL).
+# After stop, wait out the old process before starting anew: SIGTERM delivery
+# is not process death, and launching beside a dying tunnel means two clients
+# fighting over utun/DNS/routes. Best-effort only: ~10s poll, then a single
+# helper stop whose output is discarded here. The helper deliberately never
+# escalates to SIGKILL (recycled-PID hazard); it reports a survivor on its own
+# stop command, so callers that must not race one re-check (cmd_start's
+# already-running guard).
 wait_until_vpn_gone() {
   local waited=0 pid
   while :; do
@@ -341,7 +435,7 @@ wait_until_vpn_gone() {
     waited=$((waited + 1))
   done
   if [ -x "$HELPER_BIN" ]; then
-    sudo -n "$HELPER_BIN" stop >/dev/null 2>&1 || true
+    "$SUDO_BIN" -n "$HELPER_BIN" stop >/dev/null 2>&1 || true
   fi
 }
 
@@ -352,7 +446,7 @@ wait_until_vpn_gone() {
 generate_helper() {
   local pid_support=0
   openconnect_supports_pid_file && pid_support=1
-  printf '%s\n' '#!/usr/bin/env bash'
+  printf '%s\n' '#!/bin/bash -p'
   printf '%s\n' '# auckland-vpn privileged helper — GENERATED by "auckland-vpn setup-sudo".'
   printf '%s\n' '# Installed root-owned; the sudoers rule allows exactly:'
   printf '%s\n' "#   $HELPER_BIN start"
@@ -360,117 +454,311 @@ generate_helper() {
   printf '%s\n' '# All site values below are fixed at generation time. To change them,'
   printf '%s\n' '# edit the generator in the auckland-vpn script and re-run setup-sudo.'
   printf '%s\n' '#'
+  printf '%s\n' '# Privileged environment hardening (P0):'
+  printf '%s\n' '#   * "#!/bin/bash -p" starts bash in privileged mode before any startup'
+  printf '%s\n' '#     file could be processed; BASH_ENV/ENV are unset below regardless.'
+  printf '%s\n' '#   * The environment is reset to a fixed minimal set and every utility is'
+  printf '%s\n' '#     invoked by absolute path — nothing depends on inherited PATH.'
+  printf '%s\n' '#   * openconnect itself launches through "env -i" with an explicit minimal'
+  printf '%s\n' '#     environment, so nothing from the invoking user leaks into it.'
+  printf '%s\n' '#   * The sudoers fragment carries NOSETENV (sudo never honours SETENV or a'
+  printf '%s\n' '#     user-provided environment for these commands) plus a command-scoped'
+  printf '%s\n' '#     secure_path as defence in depth. The helper also pins the invoking'
+  printf '%s\n' '#     identity: SUDO_UID/SUDO_GID must equal the baked CALLER_UID/GID.'
+  printf '%s\n' '#'
   printf '%s\n' '# Residual risk (accepted): openconnect and its libraries live in the'
   printf '%s\n' '# user-writable Homebrew prefix. The tamper check below blocks OTHER'
   printf '%s\n' '# local users and world/staff-writable paths; it cannot stop the account'
   printf '%s\n' '# owner or another admin from swapping the binary — they already hold'
   printf '%s\n' '# full sudo via the admin group, so nothing is granted that was not'
   printf '%s\n' '# already theirs.'
+  printf '%s\n' '#'
+  printf '%s\n' '# Root-side writes happen ONLY under HELPER_DIR and LOG_DIR (both root-'
+  printf '%s\n' '# owned directories installed by setup-sudo): the log is pre-created'
+  printf '%s\n' '# owned by CALLER_UID:CALLER_GID mode 600 and appended via fd 3 — never'
+  printf '%s\n' '# chowned/recreated at runtime; the pidfile is PRE-CREATED root-owned'
+  printf '%s\n' '# 644 by setup-sudo and KEPT across stops (openconnect truncates an'
+  printf '%s\n' '# existing --pid-file; readers tolerate it empty/stale); the TOTP token'
+  printf '%s\n' '# file is a root-owned mktemp (mode 600 via umask) removed by the EXIT'
+  printf '%s\n' '# trap. The helper opens no user-owned path: credentials arrive on'
+  printf '%s\n' '# stdin as two records.'
   # Baked values (%q makes each safe as a literal shell assignment).
   printf 'OC=%q\n' "$OPENCONNECT_BIN"
-  printf 'VPNC_SCRIPT=%q\n' "$SCRIPT_PATH"
+  printf 'VPNC_SCRIPT=%q\n' "$STAGED_VPNC_SCRIPT"
   printf 'PROTO=%q\n' "$VPN_PROTO"
   printf 'SERVER=%q\n' "$VPN_SERVER"
   printf 'VPN_USER=%q\n' "$VPN_USER"
-  printf 'TOKEN_SECRET=%q\n' "$SECRET_FILE"
   printf 'LOG_FILE=%q\n' "$LOG_FILE"
   printf 'PID_FILE=%q\n' "$PID_FILE"
+  printf 'OP_LOCK=%q\n' "$HELPER_DIR/operation.lock"
+  printf 'TOKEN_DIR=%q\n' "$HELPER_DIR"
+  printf 'CALLER_UID=%q\n' "$(/usr/bin/id -u)"
+  printf 'CALLER_GID=%q\n' "$(/usr/bin/id -g)"
   printf 'OC_HAS_PID_FILE=%q\n' "$pid_support"
   cat <<'BODY'
 set -euo pipefail
 
+# Fixed minimal privileged environment: no inherited variable survives.
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+HOME=/var/root
+USER=root
+LOGNAME=root
+LANG=C
+unset BASH_ENV ENV CDPATH GLOBIGNORE
+
+umask 077
+
+TOKEN_FILE=""
+LOCK_HELD=""
+
+# Remove our temp token file and our operation lock. Runs ONLY via the EXIT
+# trap: signals map to conventional exit codes (see traps below) whose EXIT
+# handling still releases the lock/token. Trapping cleanup directly on
+# HUP/INT/TERM made the handler RETURN and RESUME a half-torn-down
+# privileged run. The lock dir carries our PID so we only ever remove a
+# lock we acquired ourselves; marker-file + rmdir (never rm -rf) so any
+# unexpected extra contents become a loud failure, not swallowed debris.
+cleanup() {
+  if [ -n "$TOKEN_FILE" ]; then /bin/rm -f "$TOKEN_FILE"; fi
+  if [ -n "$LOCK_HELD" ] \
+      && [ "$(/bin/cat "$OP_LOCK/pid" 2>/dev/null || true)" = "$$" ]; then
+    /bin/rm -f "$OP_LOCK/pid"
+    /bin/rmdir "$OP_LOCK" 2>/dev/null || true
+  fi
+  return 0
+}
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 die() { echo "auckland-vpn helper: error: $*" >&2; exit 1; }
 
 usage() {
-  echo "usage: $(basename "$0") start|stop" >&2
+  echo "usage: $(/usr/bin/basename "$0") start|stop" >&2
   exit 2
 }
 
-# Tamper check for the trusted path: every component from the path itself up
-# to / must exist, be owned by root or the invoking user, carry no
-# WORLD-writable bit, and allow group-write only for the 'admin' group
-# (gid 80 — stock Homebrew ships admin-writable dirs, and admin members
-# already hold full sudo, so that grants them nothing new). A staff/group-
-# writable or world-writable ancestor would hand root code execution to
-# arbitrary local users via the privileged helper.
-path_is_trusted() {
-  local p="$1" perms t hops=0
-  local ok_uid="${SUDO_UID:-$(id -u)}"
-  while :; do
-    [ -e "$p" ] || return 1
-    local u g; u="$(stat -f '%u' "$p")"; g="$(stat -f '%g' "$p")"
-    [ "$u" = "$ok_uid" ] || [ "$u" = "0" ] || return 1
-    perms="$(stat -f '%Sp' "$p")"          # e.g. "-rwxr-xr-x"
-    case "$perms" in
-      ????????w*) return 1 ;;              # other-write set: any user can tamper
-      ?????w*)
-        [ "$g" = "80" ] || return 1 ;;     # group-write outside 'admin'
+# Atomic root-side operation lock: only ONE start OR stop runs at a time.
+# /bin/mkdir is atomic. A leftover directory may be stale debris from a
+# killed helper, but automatic reclamation races with another contender
+# acquiring the replacement lock. Fail closed and require an operator to
+# verify no helper operation is active before removing stale state.
+acquire_lock() {
+  local holder tries=0
+  until /bin/mkdir "$OP_LOCK" 2>/dev/null; do
+    tries=$((tries + 1))
+    [ "$tries" -le 10 ] || die "cannot acquire operation lock at $OP_LOCK (stale or corrupt). Verify no helper operation is running, then inspect and remove the lock manually as root."
+    holder="$(/bin/cat "$OP_LOCK/pid" 2>/dev/null || true)"
+    case "$holder" in
+      ''|*[!0-9]*)
+        if [ "$tries" -le 10 ]; then
+        echo "auckland-vpn helper: lock marker at $OP_LOCK is empty (attempt $tries/10) — waiting for its owner to record its PID." >&2
+        /bin/sleep 0.2
+        continue
+        fi
+        die "operation lock at $OP_LOCK has an empty or corrupt PID marker; verify no helper operation is running, then inspect and remove the lock manually as root."
+        ;;
+      *)
+        if kill -0 "$holder" 2>/dev/null; then
+          die "another start/stop operation is in progress (pid $holder); try again shortly."
+        fi
+        die "operation lock at $OP_LOCK names dead pid $holder; verify no helper operation is running, then inspect and remove the lock manually as root."
+        ;;
     esac
-    if [ -L "$p" ]; then                   # keep checking via the link target
-      hops=$((hops + 1))
-      [ "$hops" -gt 16 ] && return 1       # symlink loop / absurd chain
-      t="$(readlink "$p")"
-      case "$t" in
-        /*) p="$t" ;;
-        *)  p="${p%/*}/$t" ;;
-      esac
-      continue
-    fi
-    [ "$p" != "/" ] || return 0
-    p="$(dirname "$p")"
   done
+  printf '%s\n' "$$" >"$OP_LOCK/pid"
+  LOCK_HELD=1
+}
+
+# Tamper check for the trusted path: the path itself, every ancestor up to
+# /, and the target chain of EVERY symlink met anywhere along the way
+# (leaf or ancestor) must exist, be owned by root or the invoking user
+# (CALLER_UID), carry no WORLD-writable bit, and allow group-write only for
+# the 'admin' group (gid 80 — stock Homebrew ships admin-writable dirs, and
+# admin members already hold full sudo, so that grants them nothing new).
+# A staff/group-writable or world-writable component would hand root code
+# execution to arbitrary local users via the privileged helper. Note this
+# validates symlink HOLDERS as well as targets: a writable directory
+# containing a link could swap the binary even when the target looks clean.
+path_is_trusted() {
+  _trust_hops=0
+  _trust_path "$1"
+}
+
+# Recursive validator behind path_is_trusted. Every object is checked
+# itself (BSD stat without -L inspects the link object, not its target —
+# so a hostile-owned link is refused right here), then symlink targets are
+# resolved and validated, then parents are ascended. Revisits simply
+# re-validate (checks are pure); only the hop budget terminates runaway
+# chains, so loops fail closed instead of hanging root.
+_trust_path() {
+  local p="$1" t d
+  _trust_hops=$((_trust_hops + 1))
+  [ "$_trust_hops" -gt 256 ] && return 1
+  check_one_trusted_path "$p" || return 1
+  if [ -L "$p" ]; then
+    t="$(/usr/bin/readlink "$p")"
+    case "$t" in
+      /*) : ;;
+      *)  t="$(/usr/bin/dirname "$p")/$t" ;;
+    esac
+    _trust_path "$t" || return 1
+  fi
+  if [ "$p" != "/" ]; then
+    d="$(/usr/bin/dirname "$p")"
+    case "$d" in ""|"."|"$p") return 1 ;; esac
+    _trust_path "$d" || return 1
+  fi
+  return 0
+}
+
+# Ownership/mode gate for exactly one filesystem object. BSD stat without
+# -L inspects a symlink itself (not its target): the link's own owner/mode
+# must pass here, and callers resolve targets separately — never skipped.
+check_one_trusted_path() {
+  local p="$1" u g perms
+  [ -e "$p" ] || return 1
+  u="$(/usr/bin/stat -f '%u' "$p")"; g="$(/usr/bin/stat -f '%g' "$p")"
+  [ "$u" = "$CALLER_UID" ] || [ "$u" = "0" ] || return 1
+  perms="$(/usr/bin/stat -f '%Sp' "$p")"     # e.g. "-rwxr-xr-x"
+  case "$perms" in
+    ????????w*) return 1 ;;                  # other-write set: any user can tamper
+    ?????w*)
+      [ "$g" = "80" ] || return 1 ;;         # group-write outside 'admin'
+  esac
+  return 0
+}
+
+# Every ancestor directory from the given dir up to / must pass the same
+# gate. (Kept for the generated helper's static lint surface; the trust
+# walk above resolves symlinks itself, so ancestors holding links are
+# validated through _trust_path, not around it.)
+check_trusted_parents() {
+  local d="$1"
+  while [ -n "$d" ] && [ "$d" != "/" ] && [ "$d" != "." ]; do
+    check_one_trusted_path "$d" || return 1
+    d="$(/usr/bin/dirname "$d")"
+  done
+  check_one_trusted_path "/" || return 1
+}
+
+# Shared pidfile gate used by BOTH helper start and stop: it must exist, be
+# a regular non-symlink file, and be owned by root — or by the pinned
+# invoking user (CALLER_UID), which keeps this validator exercisable in
+# unprivileged sandboxes; production keeps the file root-owned inside the
+# root-owned HELPER_DIR, so no third party can plant one either way.
+# Anything else is refused loudly and never touched blindly by root.
+validate_pid_file() {
+  local owner
+  if [ ! -e "$PID_FILE" ] && [ ! -L "$PID_FILE" ]; then
+    die "no pidfile at $PID_FILE (setup-sudo pre-creates it) — was the VPN started by the helper?"
+  fi
+  if [ -L "$PID_FILE" ] || [ ! -f "$PID_FILE" ]; then
+    die "$PID_FILE exists but is not a regular root-owned file; remove it manually as root, then retry."
+  fi
+  owner="$(/usr/bin/stat -f '%u' "$PID_FILE")" || die "cannot read the owner of $PID_FILE"
+  if [ "$owner" != "0" ] && [ "$owner" != "$CALLER_UID" ]; then
+    die "$PID_FILE is owned by uid $owner, not root; remove it manually as root, then retry."
+  fi
 }
 
 cmd_start() {
+  acquire_lock
+
   # Refuse to run anything as root unless the exact generated paths are intact.
   path_is_trusted "$OC"          || die "$OC is missing or not root-trusted; refusing to start."
   path_is_trusted "$VPNC_SCRIPT" || die "$VPNC_SCRIPT is missing or not root-trusted; refusing to start."
   [ "$OC_HAS_PID_FILE" = "1" ] || die "$OC lacks --pid-file support; re-run: auckland-vpn setup-sudo"
-  [ -r "$TOKEN_SECRET" ]       || die "cannot read TOTP secret at $TOKEN_SECRET"
 
-  # The VPN password arrives on stdin from the wrapper's Keychain lookup.
-  # Validate it, then re-feed it explicitly: our 'read' consumes the piped
-  # line, and openconnect's stdin would otherwise be at EOF, making
-  # --passwd-on-stdin see an empty password.
-  local pass=""
+  # The log was pre-created by setup-sudo inside the ROOT-owned LOG_DIR,
+  # owned by the invoking user, mode 600 — so the user cannot swap it and we
+  # never chown/recreate it here. Open ONCE; every write this run goes
+  # through fd 3 (banner + openconnect output). Missing file => old install.
+  if [ ! -f "$LOG_FILE" ] || [ -L "$LOG_FILE" ]; then
+    die "log missing or not a regular file at $LOG_FILE; re-run: auckland-vpn setup-sudo"
+  fi
+  exec 3>>"$LOG_FILE"
+
+  # The pidfile is PRE-CREATED root-owned mode 644 by setup-sudo and KEPT
+  # across stops: openconnect truncates an existing --pid-file, and the
+  # unprivileged wrapper only ever READS it (empty/stale records between
+  # runs are normal; readers fall back gracefully). Root never chowns or
+  # chmods it at runtime — the installer fixed owner and mode. A symlink or
+  # foreign-owned file is refused above, never touched.
+  validate_pid_file
+  # One tunnel at a time, enforced under the operation lock: if the recorded
+  # PID is still our live openconnect, refuse instead of truncating its
+  # record and launching a second client beside it. (The wrapper's own
+  # preflight covers the unrecorded case, but two wrappers can both pass it
+  # before the first tunnel records its PID.)
+  local existing_pid existing_cmd
+  existing_pid="$(/bin/cat "$PID_FILE" 2>/dev/null || true)"
+  case "$existing_pid" in
+    ''|*[!0-9]*) : ;;   # empty/stale record between runs: normal, proceed
+    *)
+      existing_cmd="$(/bin/ps -p "$existing_pid" -o command= 2>/dev/null || true)"
+      case "$existing_cmd" in
+        *openconnect*"$SERVER"*)
+          die "already connected/starting (pid $existing_pid); use restart to replace it."
+          ;;
+      esac
+      ;;
+  esac
+  # Truncate so the wait below can only observe THIS attempt's pid: a
+  # leftover record from a previous run must not read as fresh success.
+  : >"$PID_FILE"
+
+  # Credentials arrive on stdin as TWO newline-terminated records: VPN
+  # password, then TOTP secret. Newline framing is safe because 'setup'
+  # strips ALL whitespace from stored secrets, the wrapper strips the TOTP
+  # secret again, and the wrapper REJECTS any stored password containing a
+  # newline before piping anything. Root reads NO user-owned path — the
+  # wrapper reads the secret itself.
+  local pass="" token=""
   IFS= read -r pass || true
   [ -n "$pass" ] || die "no VPN password received on stdin"
+  IFS= read -r token || true
+  [ -n "$token" ] || die "no TOTP secret received on stdin"
 
-  umask 077
-  # Rotate the previous attempt to .prev instead of truncating, so history
-  # survives reboots and retries (.prev = the run before this one). mv is a
-  # rename: it moves even a hostile symlink AT the log path out of the way,
-  # after which >> creates a fresh regular file — the link can't redirect us.
-  if [ -f "$LOG_FILE" ] || [ -L "$LOG_FILE" ]; then
-    if ! mv -f "$LOG_FILE" "$LOG_FILE.prev"; then
-      die "cannot rotate log at $LOG_FILE"
-    fi
-  fi
-  # Append a dated banner, then openconnect's output. A failed write must be
-  # reported as itself, not as "Connection failed".
-  if ! printf '==== auckland-vpn start %s ====\n' "$(date '+%Y-%m-%d %H:%M:%S')" >>"$LOG_FILE"; then
-    die "cannot write log at $LOG_FILE"
-  fi
-  # Log is created as root; hand ownership to the invoking user so
-  # 'auckland-vpn log' (running unprivileged) can read it. Mode stays 600.
-  if [ -n "${SUDO_USER:-}" ]; then chown "$SUDO_USER" "$LOG_FILE"; fi
-  rm -f "$PID_FILE"
+  # --token-secret=@file needs a real path: park the secret in a root-owned
+  # mktemp INSIDE HELPER_DIR, removed by the cleanup trap (openconnect
+  # unlinks @files after reading; the trap covers failures). umask 077 plus
+  # mktemp already yield mode 600 — no runtime chmod needed.
+  TOKEN_FILE="$(/usr/bin/mktemp "$TOKEN_DIR/token.XXXXXX")" \
+    || die "cannot create token temp file in $TOKEN_DIR"
+  printf '%s\n' "$token" >"$TOKEN_FILE"
+
+  # Append the dated banner via the open fd. The log is append-only with
+  # per-attempt banners ('attempt_log' scopes by banner); there is no .prev
+  # rotation — recreating/renaming the log would force runtime chowns.
+  printf '==== auckland-vpn start %s ====\n' "$(/bin/date '+%Y-%m-%d %H:%M:%S')" >&3 \
+    || die "cannot write log at $LOG_FILE"
 
   # Fixed arguments only — nothing here comes from the invoking user.
   # openconnect backgrounds itself after connecting (--background) and writes
   # the daemon PID to $PID_FILE (--pid-file), which 'stop' uses instead of
-  # pattern-killing processes.
-  if ! printf '%s\n' "$pass" | "$OC" \
+  # pattern-killing processes. umask 022 so a freshly created pidfile would
+  # be world-readable (setup-sudo normally pre-creates it mode 644; this
+  # covers a first creation too). Launched via env -i: explicit env only.
+  # --non-inter (audit P1): if the server rejects the software token or
+  # presents an unsupported auth form, FAIL instead of waiting on stdin this
+  # root, background process can never supply.
+  umask 022
+  if ! printf '%s\n' "$pass" | /usr/bin/env -i \
+      PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME=/var/root USER=root LOGNAME=root LANG=C \
+      "$OC" \
       --protocol="$PROTO" \
       --user="$VPN_USER" \
       --passwd-on-stdin \
+      --non-inter \
       --token-mode=totp \
-      --token-secret="@$TOKEN_SECRET" \
+      --token-secret="@$TOKEN_FILE" \
       --reconnect-timeout=300 \
       --background \
       --pid-file="$PID_FILE" \
       --script="$VPNC_SCRIPT" \
-      "$SERVER" >>"$LOG_FILE" 2>&1; then
+      "$SERVER" >&3 2>&1; then
     die "openconnect failed to launch; see $LOG_FILE"
   fi
 
@@ -478,45 +766,79 @@ cmd_start() {
   local waited=0
   while [ ! -s "$PID_FILE" ]; do
     [ "$waited" -ge 60 ] && die "no PID reported after 30s; see $LOG_FILE"
-    sleep 0.5
+    /bin/sleep 0.5
     waited=$((waited + 1))
   done
-  # Hand the pidfile to the invoking user too: the wrapper reads it for
-  # status, the already-running guard, and restart's wait-until-gone.
-  if [ -n "${SUDO_USER:-}" ]; then chown "$SUDO_USER" "$PID_FILE"; fi
-  echo "VPN started (pid $(cat "$PID_FILE")). Log: $LOG_FILE"
+  # PID not secret; the unprivileged wrapper reads it for status/guards.
+  # Owner and mode were fixed at install time (root:wheel 644) and openconnect
+  # only truncates/writes the existing file — nothing to normalize here, and
+  # root never chowns/chmods at runtime.
+  echo "VPN started (pid $(/bin/cat "$PID_FILE")). Log: $LOG_FILE"
 }
 
 cmd_stop() {
-  [ -s "$PID_FILE" ] || die "no pidfile at $PID_FILE — was the VPN started by the helper?"
-  local pid
-  pid="$(cat "$PID_FILE")"
-  case "$pid" in ''|*[!0-9]*) die "corrupt pidfile $PID_FILE" ;; esac
+  acquire_lock
+  validate_pid_file
+  local pid lstart now waited=0 cmdline
+  pid="$(/bin/cat "$PID_FILE")"
+  case "$pid" in
+    '')
+      # The pidfile persists across stops; an empty record just means no VPN
+      # is running (e.g. after a failed start). Nothing to do — no sudo-side
+      # drama, nothing removed.
+      echo "No VPN is recorded as running (pidfile is empty); nothing to stop."
+      return 0
+      ;;
+    *[!0-9]*) die "corrupt pidfile $PID_FILE" ;;
+  esac
 
   # Kill the recorded PID only if it still belongs to OUR openconnect
-  # (guards against PID reuse). Never pattern-kill other processes.
-  local cmdline
-  cmdline="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+  # (guards against PID reuse). Never pattern-kill other processes. A record
+  # naming anything else is a stale leftover from a finished run: say so and
+  # stop cleanly — the pidfile is kept, the next start truncates it.
+  cmdline="$(/bin/ps -p "$pid" -o command= 2>/dev/null || true)"
   if [[ "$cmdline" != *openconnect* || "$cmdline" != *"$SERVER"* ]]; then
-    die "pid $pid is no longer our openconnect ('$cmdline'); remove $PID_FILE manually."
+    echo "Not connected (recorded pid $pid is no longer our openconnect)."
+    return 0
   fi
+  # Pin the process identity across the WHOLE wait with its start time:
+  # if the PID vanishes (reaped) or is REUSED mid-wait (lstart changes),
+  # break WITHOUT escalating — SIGKILL must never land on a recycled PID.
+  lstart="$(/bin/ps -p "$pid" -o lstart= 2>/dev/null || true)"
 
   kill "$pid"
-  local waited=0
-  while ps -p "$pid" >/dev/null 2>&1; do
-    if [ "$waited" -ge 20 ]; then        # ~10s, then escalate
-      kill -9 "$pid" 2>/dev/null || true
-      break
+  while :; do
+    now="$(/bin/ps -p "$pid" -o lstart= 2>/dev/null || true)"
+    if [ -z "$now" ] || [ "$now" != "$lstart" ]; then
+      break                                    # gone, or reused: stop waiting
     fi
-    sleep 0.5
+    if [ "$waited" -ge 20 ]; then              # ~10s
+      # No SIGKILL escalation: on a recycled PID it would kill an innocent
+      # process. Report honestly, remove nothing, fail loudly.
+      echo "Warning: openconnect (pid $pid) did not exit within ~10s of SIGTERM." >&2
+      echo "It was deliberately NOT force-killed (SIGKILL could land on a recycled PID)." >&2
+      echo "Inspect it manually:  /bin/ps -p $pid -o lstart=,command=" >&2
+      echo "If the machine has rebooted since, or the process is really gone," >&2
+      echo "this stale record is harmless — the next start reuses the pidfile." >&2
+      exit 1
+    fi
+    /bin/sleep 0.5
     waited=$((waited + 1))
   done
-  rm -f "$PID_FILE"
+  # The pidfile is persistent infrastructure (root-owned 644): keep it with
+  # its now-dead PID. Readers tolerate stale records; the next start
+  # truncates it before launching a fresh daemon.
   echo "Disconnected."
 }
 
 main() {
   [ $# -eq 1 ] || usage
+  # Pin the invoking identity: sudo always exports SUDO_UID/SUDO_GID, and
+  # they must match what was baked in at generation time (a sudoers rule
+  # copied to another account must not drive this helper).
+  if [ "${SUDO_UID:-}" != "$CALLER_UID" ] || [ "${SUDO_GID:-}" != "$CALLER_GID" ]; then
+    die "invoking uid/gid (${SUDO_UID:-unset}:${SUDO_GID:-unset}) does not match the installed caller ($CALLER_UID:$CALLER_GID); re-run: auckland-vpn setup-sudo"
+  fi
   case "$1" in
     start) cmd_start ;;
     stop)  cmd_stop ;;
@@ -558,7 +880,8 @@ detect_legacy_rule() {
 }
 
 # The canonical explanation shown wherever passwordless setup is missing.
-# Note: 'start' works without it — it just asks for the Mac password once.
+# Note: 'start' needs the helper installed by setup-sudo; without it, start
+# refuses here with these instructions.
 print_sudoers_hint() {
   echo "Passwordless start is not installed. Run once:"
   echo "  auckland-vpn setup-sudo"
@@ -566,17 +889,89 @@ print_sudoers_hint() {
   echo "allowing ONLY 'helper start' / 'helper stop' — never raw openconnect"
   echo "(granting the raw binary allowed arbitrary root code execution via"
   echo "--script=, and the old pkill grant could kill any root process)."
-  echo "Until then, 'auckland-vpn start' simply asks for your Mac password once."
+  echo "Until then, 'auckland-vpn start' refuses — the privileged helper is what"
+  echo "launches the tunnel; run 'auckland-vpn setup-sudo' to install it."
   detect_legacy_rule /etc/sudoers /etc/sudoers.d/* \
     || echo "Fix the warning(s) above so they cannot undermine the new rule." >&2
   return 0
+}
+
+# Emit the STATIC privileged installer. NOTHING is interpolated into the
+# emitted text: every site value arrives as a positional parameter, so
+# apostrophes or spaces in any path can no longer silently break an
+# installed command. Layout:
+#   $1 caller UID   $2 caller GID
+#   $3 HELPER_DIR   $4 LOG_DIR    $5 LOG_FILE
+#   $6 vpnc-script source   $7 staged vpnc-script destination
+#   $8 PID_FILE     $9 HELPER_BIN ${10} SUDOERS_FILE
+#   ${11} helper source     ${12} sudoers fragment source
+generate_installer() {
+  cat <<'INSTALLER'
+#!/bin/sh
+set -eu
+# Privileged install step for auckland-vpn, run as:
+#   sudo sh install.sh <12 positional parameters, see generator>
+# All site values arrive as arguments; uid/gid are re-validated numerically
+# before any use.
+CALLER_UID="$1"; CALLER_GID="$2"
+HELPER_DIR="$3"; LOG_DIR="$4"; LOG_FILE="$5"
+VPNC_SRC="$6";  VPNC_DST="$7"
+PID_FILE="$8";  HELPER_BIN="$9"; SUDOERS_FILE="${10}"
+HELPER_SRC="${11}"; SUDOERS_SRC="${12}"
+
+case "$CALLER_UID$CALLER_GID" in
+  ''|*[!0-9]*) echo "install.sh: caller uid/gid must be numeric" >&2; exit 1 ;;
+esac
+
+# Root-owned directories first; everything below lands inside them.
+install -d -o root -g wheel -m 755 "$HELPER_DIR"
+install -d -o root -g wheel -m 755 "$LOG_DIR"
+
+# Log: pre-created owned by the invoking user mode 600 inside the ROOT-owned
+# log dir; re-running heals owner/mode of an existing log. The helper only
+# ever appends to it — never chowns or recreates it at runtime.
+if [ ! -f "$LOG_FILE" ] || [ -L "$LOG_FILE" ]; then
+  rm -f "$LOG_FILE"
+  install -m 600 -o "$CALLER_UID" -g "$CALLER_GID" /dev/null "$LOG_FILE"
+fi
+chown "$CALLER_UID:$CALLER_GID" "$LOG_FILE"
+chmod 600 "$LOG_FILE"
+
+# Stage the vpnc-script copy the helper will actually run.
+install -o root -g wheel -m 755 "$VPNC_SRC" "$VPNC_DST"
+
+# Pidfile: PRE-CREATED root-owned mode 644 and KEPT across stops — openconnect
+# truncates an existing --pid-file, and the unprivileged wrapper only reads
+# it. Heal a planted symlink/non-regular file first; install() then fixes
+# owner/mode no matter what regular file was there before.
+if [ -L "$PID_FILE" ] || { [ -e "$PID_FILE" ] && [ ! -f "$PID_FILE" ]; }; then
+  rm -f "$PID_FILE"
+fi
+install -o root -g wheel -m 644 /dev/null "$PID_FILE"
+rm -f "$HELPER_DIR/vpn.pid.prev"
+
+install -o root -g wheel -m 755 "$HELPER_SRC" "$HELPER_BIN"
+
+rm -f "$SUDOERS_FILE"
+install -o root -g wheel -m 440 "$SUDOERS_SRC" "$SUDOERS_FILE"
+
+echo '--- legacy-rule scan (reporting only; nothing auto-removed from /etc/sudoers) ---'
+grep -Hn 'openconnect\|pkill' /etc/sudoers /etc/sudoers.d/* 2>/dev/null | grep NOPASSWD || true
+INSTALLER
 }
 
 # Canonical privileged setup: generates helper + sudoers fragment into a temp
 # dir, validates the sudoers syntax with visudo -cf, then installs BOTH in a
 # single sudo interaction. Never appends to /etc/sudoers.
 cmd_setup_sudo() {
-  [ "$(id -u)" -ne 0 ] || die "run this as your normal user; it will ask for your Mac password once."
+  [ "$(/usr/bin/id -u)" -ne 0 ] || die "run this as your normal user; it will ask for your Mac password once."
+  # The AUCKLAND_VPN_HELPER_BIN seam is wrapper-side test redirection ONLY:
+  # baking an environment-selected path into the persistent root NOPASSWD
+  # grant would authorise an attacker-chosen binary as root. Refuse before
+  # anything is generated and before any sudo interaction.
+  if [ -n "${AUCKLAND_VPN_HELPER_BIN:-}" ]; then
+    die "setup-sudo requires the canonical helper path (/private/etc/auckland-vpn/helper); unset AUCKLAND_VPN_HELPER_BIN to install."
+  fi
   # Prereqs and username BEFORE anything else: the generated helper bakes the
   # resolved binary paths and VPN_USER in at this moment, and no sudo prompt
   # should happen while something as basic as openconnect is still missing.
@@ -584,7 +979,15 @@ cmd_setup_sudo() {
   require_vpn_user
   openconnect_supports_pid_file \
     || die "$OPENCONNECT_BIN lacks --pid-file (needed for safe stop). Run: brew upgrade openconnect"
-  ensure_state_dir
+
+  # Resolve uid/gid ONCE, by absolute path, and validate them BEFORE they are
+  # used anywhere (they are passed as installer arguments and baked into the
+  # generated helper).
+  local caller_uid caller_gid
+  caller_uid="$(/usr/bin/id -u)" || die "cannot determine your uid."
+  caller_gid="$(/usr/bin/id -g)" || die "cannot determine your gid."
+  case "$caller_uid" in ''|*[!0-9]*) die "unexpected uid: $caller_uid" ;; esac
+  case "$caller_gid" in ''|*[!0-9]*) die "unexpected gid: $caller_gid" ;; esac
 
   # Stage in the PRIVATE state dir, never /tmp: setup-sudo must not create
   # files (even transient ones) in a world-writable, shared directory.
@@ -594,32 +997,39 @@ cmd_setup_sudo() {
   trap 'rm -rf "$tmp"' EXIT
   generate_helper >"$tmp/helper"
   chmod 755 "$tmp/helper"
-  printf '%s ALL=(root) NOPASSWD: %s start, %s stop\n' \
+  # NOSETENV: sudo will never honour SETENV or a user-supplied environment
+  # for these commands. secure_path is command-scoped defence in depth (the
+  # helper also hardcodes PATH). Validated below before anything installs.
+  printf '%s ALL=(root) NOPASSWD:NOSETENV: %s start, %s stop\n' \
     "$(whoami)" "$HELPER_BIN" "$HELPER_BIN" >"$tmp/auckland-vpn"
+  printf 'Defaults!%s secure_path="/usr/bin:/bin:/usr/sbin:/sbin"\n' \
+    "$HELPER_BIN" >>"$tmp/auckland-vpn"
   visudo -cf "$tmp/auckland-vpn" >/dev/null \
     || die "generated sudoers rule failed 'visudo -cf'; nothing was installed."
 
-  # Staged as a script so the privileged step needs no nested quoting.
-  {
-    echo '#!/bin/sh'
-    echo 'set -eu'
-    echo "install -d -o root -g wheel -m 755 '$HELPER_DIR'"
-    echo "install -o root -g wheel -m 755 '$tmp/helper' '$HELPER_BIN'"
-    echo "rm -f '$SUDOERS_FILE'"
-    echo "install -o root -g wheel -m 440 '$tmp/auckland-vpn' '$SUDOERS_FILE'"
-    echo "echo '--- legacy-rule scan (reporting only; nothing auto-removed from /etc/sudoers) ---'"
-    echo "grep -Hn 'openconnect\\|pkill' /etc/sudoers /etc/sudoers.d/* 2>/dev/null | grep NOPASSWD || true"
-  } >"$tmp/install.sh"
+  # Static installer body + all values as positional parameters: nothing is
+  # interpolated into the emitted script, so apostrophes/spaces in any path
+  # are harmless (the old inline-quoted lines broke silently on them).
+  generate_installer >"$tmp/install.sh"
 
   echo "Installing root-owned helper + restricted sudoers rule (one sudo prompt)..."
-  sudo sh "$tmp/install.sh" || die "privileged install failed."
+  "$SUDO_BIN" sh "$tmp/install.sh" \
+    "$caller_uid" "$caller_gid" \
+    "$HELPER_DIR" "$LOG_DIR" "$LOG_FILE" \
+    "$SCRIPT_PATH" "$STAGED_VPNC_SCRIPT" \
+    "$PID_FILE" "$HELPER_BIN" "$SUDOERS_FILE" \
+    "$tmp/helper" "$tmp/auckland-vpn" \
+    || die "privileged install failed."
   trap - EXIT
   rm -rf "$tmp"
   echo "Done. Passwordless sudo is now limited to exactly:"
   echo "  sudo -n $HELPER_BIN start"
   echo "  sudo -n $HELPER_BIN stop"
-  echo "Re-run 'auckland-vpn setup-sudo' after upgrading this tool: the helper"
-  echo "embeds the log path and other settings at generation time."
+  echo "Staged vpnc-script: $STAGED_VPNC_SCRIPT (used by the helper)."
+  echo "Log file: $LOG_FILE (owned by you, mode 600, inside a root-owned dir)."
+  echo "Re-run 'auckland-vpn setup-sudo' after upgrading this tool OR after"
+  echo "'brew upgrade openconnect': the helper embeds paths/settings at"
+  echo "generation time, including the staged vpnc-script copy."
   echo "If any legacy-rule lines were printed above, remove them:"
   echo "  sudo visudo (for /etc/sudoers) or: sudo rm /etc/sudoers.d/<offending-file>"
 }
@@ -628,7 +1038,7 @@ cmd_setup_sudo() {
 # in this attempt's log), still connecting, and not connected — with the last
 # error line from the log when the previous attempt failed.
 cmd_status() {
-  local pid ip last_err
+  local pid ip last_err attempt
   pid="$(running_vpn_pid || true)"
   if [ -z "$pid" ]; then
     echo "Not connected."
@@ -638,7 +1048,9 @@ cmd_status() {
     fi
     return 0
   fi
-  if attempt_log | grep -qiE 'connected as|established (dtls|tls)'; then
+  # SIGPIPE-safe: capture before grepping (see verify_tunnel_started).
+  attempt="$(attempt_log)" || attempt=""
+  if grep -qiE 'connected as|established (dtls|tls)' <<<"$attempt"; then
     ip="$(tunnel_ip_from_log || true)"
     if [ -n "$ip" ]; then
       echo "Connected as $VPN_USER (pid $pid, IP $ip)."
@@ -716,6 +1128,9 @@ cmd_setup() {
     VPN_USER="${VPN_USER#"${VPN_USER%%[![:space:]]*}"}"
     VPN_USER="${VPN_USER%"${VPN_USER##*[![:space:]]}"}"
     [ -n "$VPN_USER" ] || die "no username entered; aborted."
+    if ! username_is_valid "$VPN_USER"; then
+      die "unsupported username '$VPN_USER' (allowed: letters, digits, @ . _ -); aborted."
+    fi
     save_vpn_user_to_config
     echo "Saved VPN_USER=$VPN_USER to $CONFIG_FILE"
     echo
@@ -765,6 +1180,27 @@ cmd_setup() {
   echo "Setup complete. Connect with:  auckland-vpn start"
 }
 
+# Stored VPN password: Keychain first, else the protected-file fallback.
+# Prints the password (possibly empty); callers decide how to fail.
+stored_vpn_password() {
+  security find-generic-password -a "$VPN_USER" -s "$KEYCHAIN_SVC" -w 2>/dev/null || true
+}
+
+# TOTP secret exactly as the helper expects it on stdin: first line of the
+# secret file with ALL whitespace stripped.
+read_token_secret() {
+  head -n 1 "$SECRET_FILE" 2>/dev/null | tr -d '[:space:]'
+}
+
+# Pipe credentials to ONE passwordless 'helper start'. On failure returns
+# sudo's exit status and captures its stderr in HELPER_START_ERR for the
+# caller to classify — shared by cmd_start and the monitor's heal path so
+# both drive the identical privileged surface.
+HELPER_START_ERR=""
+try_helper_start_n() { # try_helper_start_n <password> <token>
+  HELPER_START_ERR="$(printf '%s\n%s\n' "$1" "$2" | "$SUDO_BIN" -n "$HELPER_BIN" start 2>&1 >/dev/null)"
+}
+
 cmd_start() {
   # Gates first, in the right order: who are you, is everything installed —
   # all BEFORE any sudo interaction (a missing binary must never masquerade
@@ -772,19 +1208,36 @@ cmd_start() {
   require_vpn_user
   require_prereqs
   [ -s "$SECRET_FILE" ] || die "TOTP secret missing. Run: auckland-vpn setup"
-  # Password: try Keychain first, then the protected-file fallback.
-  # (The "|| true" lets the Keychain lookup "fail" without tripping set -e.)
-  PASS="$(security find-generic-password -a "$VPN_USER" -s "$KEYCHAIN_SVC" -w 2>/dev/null || true)"
+  # Password: Keychain first, then the protected-file fallback.
+  PASS="$(stored_vpn_password)"
   if [ -z "$PASS" ] && [ -s "$PASSWORD_FILE" ]; then
     PASS="$(cat "$PASSWORD_FILE")"
   fi
   [ -z "$PASS" ] && die "VPN password not found (Keychain or $PASSWORD_FILE). Run: auckland-vpn setup"
+  # The helper frames credentials as TWO newline-terminated stdin records
+  # (password, then TOTP secret); a raw newline inside the password would
+  # corrupt that framing. Reject it here, before anything is piped. \r and
+  # spaces pass through unchanged.
+  case "$PASS" in
+    *$'\n'*) die "stored password contains a newline — re-run: auckland-vpn setup" ;;
+  esac
   if [ ! -x "$HELPER_BIN" ]; then
     print_sudoers_hint
     exit 1
   fi
   refuse_if_already_running
   ensure_state_dir
+  # From here the VPN is WANTED up: the monitor may heal it if it dies.
+  # ('stop' clears this; the monitor's own internal stop does not.)
+  : >"$MONITOR_ENABLED_FILE"
+
+  # The helper receives TWO newline-terminated stdin records: password then
+  # TOTP secret. Reading the secret HERE (not in the helper) means root never
+  # opens any user-owned path. Newline framing is safe because 'setup' strips
+  # all whitespace from the stored secret.
+  local token
+  token="$(read_token_secret)"
+  [ -n "$token" ] || die "TOTP secret at $SECRET_FILE is empty — re-run: auckland-vpn setup"
 
   echo "Connecting to $VPN_SERVER as $VPN_USER ..."
   # Attempt the REAL command non-interactively first — 'sudo -n true' would
@@ -794,16 +1247,16 @@ cmd_start() {
   # required" means the rule isn't (yet) usable → ask once via plain sudo;
   # any other failure (helper died, bad args, sudoers denial) is reported
   # from the log instead of being misread as a missing password prompt.
-  local passwordless=1 sudo_err
-  if ! sudo_err="$(printf '%s\n' "$PASS" | sudo -n "$HELPER_BIN" start 2>&1 >/dev/null)"; then
-    if [ -t 0 ] && [[ "$sudo_err" == *"a password is required"* ]]; then
+  local passwordless=1
+  if ! try_helper_start_n "$PASS" "$token"; then
+    if [ -t 0 ] && [[ "$HELPER_START_ERR" == *"a password is required"* ]]; then
       passwordless=0
       echo "(Passwordless sudo not set up — asking for your Mac password once.)"
-      if ! printf '%s\n' "$PASS" | sudo "$HELPER_BIN" start; then
+      if ! printf '%s\n%s\n' "$PASS" "$token" | "$SUDO_BIN" "$HELPER_BIN" start; then
         report_start_failure   # exits
       fi
     else
-      [ -n "$sudo_err" ] && echo "$sudo_err" >&2
+      [ -n "$HELPER_START_ERR" ] && echo "$HELPER_START_ERR" >&2
       report_start_failure   # exits
     fi
   fi
@@ -813,6 +1266,11 @@ cmd_start() {
   if ! verify_tunnel_started; then
     report_start_failure   # exits
   fi
+
+  # A deliberate manual start is an explicit user decision: clear any open
+  # auto-heal circuit breaker / backoff history (consult §backoff and
+  # circuit breaker). Ordinary network events must NOT clear it.
+  reset_monitor_history
 
   local ip
   ip="$(tunnel_ip_from_log || true)"
@@ -827,17 +1285,39 @@ cmd_start() {
 }
 
 cmd_stop() {
-  # Nothing to stop (no live process, no pidfile): say so without bothering
-  # sudo — keeps 'restart' quiet when nothing was running.
+  # The whole stop runs under the intent lock (hostile review 2026-10-03):
+  # it serializes this intent clear + privileged stop with monitor_heal's
+  # recheck + start window, so any heal launch either completed before this
+  # stop (and is killed by it) or observes intent-down under the lock and
+  # cancels — a tunnel can never be resurrected after 'stop' returns.
+  local rc=0
+  ensure_state_dir
+  intent_lock_acquire
+  trap intent_lock_release EXIT   # safety net for die()/set -e exits
+  stop_unlocked || rc=$?
+  intent_lock_release
+  trap - EXIT
+  return "$rc"
+}
+
+stop_unlocked() {
+  # An explicit user stop means the VPN is NO LONGER wanted up: clear the
+  # monitor's intent first thing (even on the early "nothing running" path),
+  # so the monitor never resurrects a tunnel the user stopped.
+  rm -f "$MONITOR_ENABLED_FILE" 2>/dev/null || true
+  # Nothing to stop (no live process, no non-empty pidfile): say so without
+  # bothering sudo — keeps 'restart' quiet when nothing was running. The
+  # pidfile persists across stops, so an EMPTY record is a normal "nothing
+  # running" state, not an error.
   local pid
   pid="$(running_vpn_pid || true)"
-  if [ -z "$pid" ] && [ ! -e "$PID_FILE" ]; then
+  if [ -z "$pid" ] && [ ! -s "$PID_FILE" ]; then
     echo "Not connected."
     return 0
   fi
   # Preferred path: the root-owned helper kills the exact recorded PID.
   if [ -x "$HELPER_BIN" ]; then
-    if sudo -n "$HELPER_BIN" stop; then
+    if "$SUDO_BIN" -n "$HELPER_BIN" stop; then
       return 0
     fi
     # NEVER pattern-kill when a pidfile exists: the exact-PID guarantee is the
@@ -864,7 +1344,7 @@ stop_legacy_fallback() {
   if pgrep -f "$pat" >/dev/null 2>&1; then
     echo "Warning: helper unavailable; killing openconnect by pattern." >&2
     echo "         Run 'auckland-vpn setup-sudo' for the safe per-PID stop." >&2
-    sudo pkill -f "$pat" || die "could not stop openconnect."
+    "$SUDO_BIN" pkill -f "$pat" || die "could not stop openconnect."
     # pkill only SIGNALS; confirm the process is really gone before claiming
     # success (bounded ~5 s).
     while pgrep -f "$pat" >/dev/null 2>&1; do
@@ -881,14 +1361,683 @@ stop_legacy_fallback() {
   fi
 }
 
-# restart = stop, WAIT until the old process is really gone (SIGTERM delivery
-# is not death — a blind sleep launched a second tunnel beside a dying one),
-# then start. cmd_start's already-running guard backs this up.
+# restart = stop, wait out the old process (best-effort: see
+# wait_until_vpn_gone), then start. cmd_start's already-running guard is the
+# actual guarantee that a survivor cannot race a second tunnel.
 cmd_restart() {
   cmd_stop
   wait_until_vpn_gone
   cmd_start
 }
+
+# ---- Monitor / auto-heal -----------------------------------------------------
+# Promoted from the verified prototypes/monitor state machine (issue #14;
+# design spec: docs/consults/reliability.md). An opt-in foreground supervisor:
+#
+#   * every INTERVAL seconds it classifies the tunnel as healthy /
+#     reconnecting / degraded / dead using unprivileged signals only —
+#     pidfile PID alive AND its argv is our openconnect, a utun interface
+#     carrying the tunnel IP, and an end-to-end DNS probe through the VPN
+#     resolver compared against the system resolver;
+#   * while the VPN is WANTED (see intent below) and stays broken past the
+#     grace windows, it heals by driving the EXISTING privileged surface —
+#     'sudo -n helper stop' then the same credential plumbing 'start' uses —
+#     so the sudoers grant stays byte-identical;
+#   * exponential backoff between attempts (0..600s, capped at BACKOFF_CAP),
+#     a circuit breaker after MAX_RESTART_ATTEMPTS failures, and best-effort
+#     osascript notifications with fixed literal messages.
+#
+# Intent ("desired state"): 'start'/'restart' mark the VPN wanted via
+# MONITOR_ENABLED_FILE; an explicit user 'stop' clears it. The monitor never
+# resurrects a tunnel the user stopped (the consult's rejected-shortcut #4).
+#
+# AUCKLAND_VPN_DRY_RUN=1 makes healing log the would-be commands without
+# invoking sudo — this is what the test suite exercises.
+INTERVAL=${INTERVAL:-20}                          # poll period (s)
+RECONNECT_GRACE=${RECONNECT_GRACE:-90}            # wedged-PID patience (s)
+DEGRADED_THRESHOLD=${DEGRADED_THRESHOLD:-2}       # consecutive DNS failures
+DEGRADED_GRACE=${DEGRADED_GRACE:-120}             # degraded dwell before heal (s)
+NETWORK_SETTLE_GRACE=${NETWORK_SETTLE_GRACE:-30}  # post-death/wake settle (s)
+MAX_RESTART_ATTEMPTS=${MAX_RESTART_ATTEMPTS:-5}   # circuit opens after N tries
+CIRCUIT_COOLDOWN=${CIRCUIT_COOLDOWN:-3600}        # breaker cool-down (s)
+BACKOFF_CAP=${BACKOFF_CAP:-900}                   # restart backoff cap (15 min)
+
+# In-memory mirror of the persisted counters (see save/load below).
+current_state=unknown
+bad_since=0 degraded_count=0 restart_attempts=0 next_attempt=0
+circuit_until=0 healthy_count=0
+
+# Refuse nonsense thresholds up front: every one of these lands in arithmetic
+# or test contexts where garbage would fail obscurely later.
+monitor_validate_config() {
+  local v
+  for v in "$INTERVAL" "$RECONNECT_GRACE" "$DEGRADED_THRESHOLD" \
+           "$DEGRADED_GRACE" "$NETWORK_SETTLE_GRACE" \
+           "$MAX_RESTART_ATTEMPTS" "$CIRCUIT_COOLDOWN" "$BACKOFF_CAP"; do
+    case "$v" in
+      ''|*[!0-9]*) die "monitor: threshold '$v' is not a non-negative integer" ;;
+    esac
+  done
+}
+
+# Single-monitor lock: atomic mkdir (flock is not stock macOS), with a PID
+# marker so only a provably-dead owner's lock is ever taken over.
+monitor_lock_acquire() {
+  local holder tries=0
+  until mkdir "$MONITOR_LOCK_DIR" 2>/dev/null; do
+    tries=$((tries + 1))
+    [ "$tries" -le 5 ] || die "cannot acquire the monitor lock at $MONITOR_LOCK_DIR.
+If no monitor is running, remove it:  rm -rf '$MONITOR_LOCK_DIR'"
+    holder="$(cat "$MONITOR_LOCK_DIR/pid" 2>/dev/null || true)"
+    case "$holder" in
+      ''|*[!0-9]*)
+        sleep 0.2 ;;   # owner may sit in its mkdir→write-pid window; wait it out
+      *)
+        if kill -0 "$holder" 2>/dev/null; then
+          die "another monitor is already running (pid $holder)."
+        fi
+        rm -f "$MONITOR_LOCK_DIR/pid"
+        rmdir "$MONITOR_LOCK_DIR" 2>/dev/null || true
+        ;;
+    esac
+  done
+  printf '%s\n' "$$" >"$MONITOR_LOCK_DIR/pid"
+}
+
+# Runs from EXIT/HUP/INT/TERM traps: remove ONLY a lock we own ourselves.
+monitor_lock_release() {
+  if [ "$(cat "$MONITOR_LOCK_DIR/pid" 2>/dev/null || true)" = "$$" ]; then
+    rm -f "$MONITOR_LOCK_DIR/pid"
+    rmdir "$MONITOR_LOCK_DIR" 2>/dev/null || true
+  fi
+  return 0
+}
+
+# Serializes intent changes with the heal launch window (hostile review
+# 2026-10-03): 'stop' holds this lock across clearing MONITOR_ENABLED_FILE
+# and the privileged stop; monitor_heal holds it across its final intent
+# recheck and helper start. The helper's own operation lock serializes
+# individual privileged commands, not this wrapper-side check-then-launch
+# window — without a shared mutex, an explicit stop can complete between
+# the monitor's recheck and its start, and the tunnel the user just killed
+# comes back to life.
+intent_lock_acquire() {
+  local holder tries=0
+  until mkdir "$INTENT_LOCK_DIR" 2>/dev/null; do
+    tries=$((tries + 1))
+    # A wedged heal launch (helper start can block ~30s waiting for the
+    # daemon pidfile) justifies a generous bound, not an error.
+    [ "$tries" -le 300 ] || die "cannot acquire the intent lock at $INTENT_LOCK_DIR after ~60s.
+If nothing is stopping or healing, remove it:  rm -rf '$INTENT_LOCK_DIR'"
+    holder="$(cat "$INTENT_LOCK_DIR/pid" 2>/dev/null || true)"
+    case "$holder" in
+      ''|*[!0-9]*)
+        sleep 0.2 ;;   # owner may sit in its mkdir→write-pid window; wait it out
+      *)
+        if kill -0 "$holder" 2>/dev/null; then
+          sleep 0.2
+        else
+          # Do not reclaim automatically: two contenders can both observe
+          # this dead PID, then one can delete the other's replacement lock.
+          # The rare crash-left lock is safer to recover manually after
+          # checking that no stop/heal process is active.
+          die "intent lock at $INTENT_LOCK_DIR has a stale PID ($holder); verify no VPN stop/heal is running, then remove the stale lock directory manually."
+        fi
+        ;;
+    esac
+  done
+  printf '%s\n' "$$" >"$INTENT_LOCK_DIR/pid"
+  INTENT_LOCK_HELD=1
+}
+
+# Release ONLY a lock we own ourselves; safe to call from any EXIT trap.
+intent_lock_release() {
+  if [ "${INTENT_LOCK_HELD:-0}" = "1" ] \
+      && [ "$(cat "$INTENT_LOCK_DIR/pid" 2>/dev/null || true)" = "$$" ]; then
+    rm -f "$INTENT_LOCK_DIR/pid"
+    rmdir "$INTENT_LOCK_DIR" 2>/dev/null || true
+  fi
+  INTENT_LOCK_HELD=0
+  return 0
+}
+
+# Atomically persist the counters: mktemp in STATE_DIR (same filesystem =>
+# rename works), mode 600 via chmod, then rename into place — the established
+# private-write pattern of this script. Readers NEVER source this file.
+save_monitor_state() {
+  local tmp
+  tmp="$(mktemp "$STATE_DIR/.monitor-state.XXXXXX")" || return 1
+  if {
+    printf 'current_state=%s\n' "$current_state"
+    printf 'bad_since=%s\n' "$bad_since"
+    printf 'degraded_count=%s\n' "$degraded_count"
+    printf 'restart_attempts=%s\n' "$restart_attempts"
+    printf 'next_attempt=%s\n' "$next_attempt"
+    printf 'circuit_until=%s\n' "$circuit_until"
+    printf 'healthy_count=%s\n' "$healthy_count"
+  } >"$tmp" && chmod 600 "$tmp" && mv -f "$tmp" "$MONITOR_STATE_FILE"; then
+    return 0
+  fi
+  rm -f "$tmp"
+  return 1
+}
+
+# Load persisted counters conservatively: fields are validated into LOCALS
+# first and committed ONLY if the whole file parses — a corrupt field leaves
+# the entry defaults untouched and reports corruption to the caller. Never
+# sources or evaluates file content.
+load_monitor_state() {
+  local t_cur=unknown t_bad=0 t_deg=0 t_att=0 t_nxt=0 t_cir=0 t_heal=0
+  current_state=unknown
+  bad_since=0 degraded_count=0 restart_attempts=0 next_attempt=0
+  circuit_until=0 healthy_count=0
+  [ -f "$MONITOR_STATE_FILE" ] || return 0
+  local line k v
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in *=*) ;; *) continue ;; esac
+    k="${line%%=*}"
+    v="${line#*=}"
+    case "$k" in
+      current_state)
+        case "$v" in
+          healthy|degraded|reconnecting|dead|unknown|verifying|circuit_open|idle) t_cur="$v" ;;
+          *) return 1 ;;
+        esac
+        ;;
+      bad_since|degraded_count|restart_attempts|next_attempt|circuit_until|healthy_count)
+        case "$v" in
+          ''|*[!0-9]*) return 1 ;;
+        esac
+        case "$k" in
+          bad_since)         t_bad="$v" ;;
+          degraded_count)    t_deg="$v" ;;
+          restart_attempts)  t_att="$v" ;;
+          next_attempt)      t_nxt="$v" ;;
+          circuit_until)     t_cir="$v" ;;
+          healthy_count)     t_heal="$v" ;;
+        esac
+        ;;
+      *) ;;   # unknown keys are forward-compat noise, not corruption
+    esac
+  done <"$MONITOR_STATE_FILE"
+  current_state="$t_cur"
+  bad_since="$t_bad" degraded_count="$t_deg" restart_attempts="$t_att"
+  next_attempt="$t_nxt" circuit_until="$t_cir" healthy_count="$t_heal"
+}
+
+# Manual start = explicit user decision: forget breaker/backoff history.
+reset_monitor_history() {
+  [ -d "$STATE_DIR" ] || return 0
+  current_state=healthy
+  bad_since=0 degraded_count=0 restart_attempts=0 next_attempt=0
+  circuit_until=0 healthy_count=2
+  save_monitor_state || true
+}
+
+# Append a timestamped transition to the private monitor log; rotate past
+# ~256 KiB keeping one old generation (consult §notifications and logs).
+monitor_log() {
+  if [ -f "$MONITOR_LOG" ] \
+      && [ "$(stat -f '%z' "$MONITOR_LOG" 2>/dev/null || echo 0)" -gt 262144 ]; then
+    mv -f "$MONITOR_LOG" "$MONITOR_LOG.old" 2>/dev/null || true
+  fi
+  printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >>"$MONITOR_LOG"
+}
+
+# Best-effort macOS notification. FIXED literal messages only — callers must
+# never interpolate log text or dynamic values into AppleScript source
+# (consult §notifications). Never changes monitor state; skipped entirely in
+# dry-run (and therefore in tests).
+notify_user() {
+  [ "${AUCKLAND_VPN_DRY_RUN:-}" = "1" ] && return 0
+  [ -x /usr/bin/osascript ] || return 0
+  /usr/bin/osascript -e "display notification \"$1\" with title \"Auckland VPN\"" >/dev/null 2>&1 || true
+  return 0
+}
+
+# The recorded pidfile PID belongs to THIS VPN right now: numeric, alive,
+# and its command line names both openconnect and our server (guards against
+# PID reuse — kill -0 alone proves nothing). Prints the PID on success.
+valid_vpn_pid() {
+  local pid command
+  pid="$(cat "$PID_FILE" 2>/dev/null)" || pid=""
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  command="$(ps -p "$pid" -o command= 2>/dev/null)" || return 1
+  case "$command" in
+    *openconnect*"$VPN_SERVER") printf '%s\n' "$pid" ;;
+    *) return 1 ;;
+  esac
+}
+
+# Map a tunnel IPv4 to the utun interface actually carrying it (never assume
+# "highest utun" — macOS and other VPN products create utuns too).
+tunnel_interface() { # tunnel_interface <ipv4>
+  [ -n "$1" ] || return 1
+  /sbin/ifconfig -a 2>/dev/null | /usr/bin/awk -v ip="$1" '
+    /^[[:alnum:]]+:/ { iface=$1; sub(/:$/, "", iface) }
+    $1 == "inet" && $2 == ip && iface ~ /^utun[0-9]+$/ { print iface; exit }
+  '
+}
+
+# Interface a destination routes through (route -n get avoids DNS for IPs).
+route_interface() { # route_interface <ip-or-host>
+  [ -n "$1" ] || return 1
+  /sbin/route -n get "$1" 2>/dev/null |
+    /usr/bin/awk '$1 == "interface:" { print $2; exit }'
+}
+
+# Answer-shape policy: accept RFC1918 answers. Production hardening would pin
+# an exact allow-list for the chosen University health record (prototype
+# policy carried over deliberately).
+expected_answer() {
+  /usr/bin/awk '
+    /^10\./ { found=1 }
+    /^192\.168\./ { found=1 }
+    /^172\.(1[6-9]|2[0-9]|3[01])\./ { found=1 }
+    END { exit(found ? 0 : 1) }
+  '
+}
+
+# Direct probe: the VPN DNS server itself answers for the health host
+# (validates the ANSWER, not merely dig's exit status).
+direct_dns_ok() {
+  [ -n "$VPN_DNS_SERVER" ] && [ -n "$VPN_HEALTH_HOST" ] || return 1
+  /usr/bin/dig +time=2 +tries=1 +short A \
+    @"$VPN_DNS_SERVER" "$VPN_HEALTH_HOST" 2>/dev/null | expected_answer
+}
+
+# System path: what applications ACTUALLY resolve via macOS resolver config.
+system_dns_ok() {
+  [ -n "$VPN_HEALTH_HOST" ] || return 1
+  /usr/bin/dscacheutil -q host -a name "$VPN_HEALTH_HOST" 2>/dev/null |
+    /usr/bin/awk '$1 == "ip_address:" { print $2 }' | expected_answer
+}
+
+# classify_state PROCESS_OK TUNNEL_OK ROUTE_OK DIRECT_DNS_OK SYSTEM_DNS_OK
+# Pure classifier (prototype contract kept; unit-tested directly).
+classify_state() {
+  local process_ok=$1 tunnel_ok=$2 route_ok=$3 direct_ok=$4 system_ok=$5
+  [ "$process_ok" -eq 1 ] || { echo dead; return 0; }
+  if [ "$tunnel_ok" -ne 1 ] || [ "$route_ok" -ne 1 ]; then
+    echo reconnecting
+  elif [ "$direct_ok" -ne 1 ] || [ "$system_ok" -ne 1 ]; then
+    echo degraded
+  else
+    echo healthy
+  fi
+}
+
+observe_state() {
+  local process_ok=0 tunnel_ok=0 route_ok=0 direct_ok=0 system_ok=0
+  local tunnel_if probe_if tip="${TUNNEL_IP:-}"
+
+  # High-confidence death FIRST: a pidfile PID that is gone or no longer our
+  # openconnect is decisive even without deep-probe configuration — this is
+  # the one state auto-heal may trust unconfigured (consult §health model).
+  if valid_vpn_pid >/dev/null 2>&1; then
+    process_ok=1
+  else
+    echo dead
+    return 0
+  fi
+
+  # Deep probes need configuration; otherwise report unknown honestly and
+  # heal nothing beyond the high-confidence death above. TUNNEL_IP comes from
+  # the environment when injected (tests/fixtures), else this attempt's log.
+  [ -n "$tip" ] || tip="$(tunnel_ip_from_log || true)"
+  if [ -z "$VPN_HEALTH_IP" ] || [ -z "$VPN_HEALTH_HOST" ] ||
+      [ -z "$VPN_DNS_SERVER" ] || [ -z "$tip" ]; then
+    echo unknown
+    return 0
+  fi
+
+  tunnel_if="$(tunnel_interface "$tip" 2>/dev/null || true)"
+  [ -n "$tunnel_if" ] && tunnel_ok=1
+  probe_if="$(route_interface "$VPN_HEALTH_IP" 2>/dev/null || true)"
+  { [ -n "$tunnel_if" ] && [ "$probe_if" = "$tunnel_if" ]; } && route_ok=1
+  if direct_dns_ok; then direct_ok=1; fi
+  if system_dns_ok; then system_ok=1; fi
+
+  classify_state "$process_ok" "$tunnel_ok" "$route_ok" "$direct_ok" "$system_ok"
+}
+
+# Exponential restart backoff in seconds; capped at BACKOFF_CAP (task spec:
+# 15 min — supersedes the consult draft's 10-minute figure).
+backoff_seconds() {
+  case "$1" in
+    1) echo 0 ;;
+    2) echo 30 ;;
+    3) echo 60 ;;
+    4) echo 120 ;;
+    5) echo 300 ;;
+    6) echo 600 ;;
+    *) echo "$BACKOFF_CAP" ;;
+  esac
+}
+
+reset_healthy_counters() {
+  bad_since=0 degraded_count=0 restart_attempts=0 next_attempt=0
+  circuit_until=0 healthy_count=2
+}
+
+# state_machine_step OBSERVED_STATE EPOCH_SECONDS -> one key=value record.
+# Emits actions as TEXT; execution happens only in monitor_act. This purity
+# is what makes the machine unit-testable (prototype contract kept).
+state_machine_step() {
+  local observed=$1 now=$2 grace=0 delay
+
+  if [ "$circuit_until" -gt "$now" ]; then
+    current_state=circuit_open
+    printf 'state=circuit_open retry_at=%s\n' "$circuit_until"
+    return 0
+  fi
+  if [ "$current_state" = "circuit_open" ] && [ "$circuit_until" -ne 0 ]; then
+    # Cool-down expired: half-open probe. The exhausted attempt count would
+    # otherwise re-trip the breaker before any recovery is tried, so rewind
+    # it to admit exactly one WOULD_RESTART: if the tunnel is still down the
+    # next failure re-opens the circuit, while two healthy passes clear it
+    # via the healthy path above.
+    if [ "${MAX_RESTART_ATTEMPTS:-5}" -ge 1 ]; then
+      restart_attempts=$((MAX_RESTART_ATTEMPTS - 1))
+    else
+      restart_attempts=0
+    fi
+    circuit_until=0
+    current_state=half_open
+  fi
+
+  case "$observed" in
+    healthy)
+      healthy_count=$((healthy_count + 1))
+      bad_since=0
+      degraded_count=0
+      if [ "$healthy_count" -lt 2 ]; then
+        current_state=verifying
+        echo 'state=verifying action=wait healthy_checks=1'
+      else
+        reset_healthy_counters
+        current_state=healthy
+        echo 'state=healthy'
+      fi
+      return 0
+      ;;
+    unknown)
+      bad_since=0
+      degraded_count=0
+      current_state=unknown
+      echo 'state=unknown action=none'
+      return 0
+      ;;
+    degraded)
+      degraded_count=$((degraded_count + 1))
+      grace=$DEGRADED_GRACE
+      ;;
+    reconnecting)
+      degraded_count=0
+      grace=$RECONNECT_GRACE
+      ;;
+    dead)
+      degraded_count=0
+      grace=$NETWORK_SETTLE_GRACE
+      ;;
+    *)
+      echo "state=unknown action=none reason=invalid_observation" >&2
+      return 2
+      ;;
+  esac
+  healthy_count=0
+
+  [ "$bad_since" -ne 0 ] || bad_since=$now
+  current_state=$observed
+
+  # One failed probe is an observation, not a transition: hysteresis first
+  # (consecutive DNS failures), then the state's grace window, then backoff.
+  if [ "$observed" = degraded ] &&
+      [ "$degraded_count" -lt "$DEGRADED_THRESHOLD" ]; then
+    printf 'state=degraded action=wait dns_failures=%s\n' "$degraded_count"
+    return 0
+  fi
+  if [ $((now - bad_since)) -lt "$grace" ]; then
+    printf 'state=%s action=wait grace_remaining=%s\n' \
+      "$observed" "$((grace - (now - bad_since)))"
+    return 0
+  fi
+  if [ "$next_attempt" -gt "$now" ]; then
+    printf 'state=%s action=backoff retry_at=%s\n' "$observed" "$next_attempt"
+    return 0
+  fi
+
+  restart_attempts=$((restart_attempts + 1))
+  if [ "$restart_attempts" -gt "$MAX_RESTART_ATTEMPTS" ]; then
+    circuit_until=$((now + CIRCUIT_COOLDOWN))
+    current_state=circuit_open
+    printf 'state=circuit_open action=notify retry_at=%s\n' "$circuit_until"
+    return 0
+  fi
+
+  delay="$(backoff_seconds "$restart_attempts")"
+  next_attempt=$((now + delay))
+  bad_since=$now
+  printf 'state=%s action=WOULD_RESTART attempt=%s next_delay=%s\n' \
+    "$observed" "$restart_attempts" "$delay"
+}
+
+monitor_intent_up() {
+  [ -f "$MONITOR_ENABLED_FILE" ]
+}
+
+# Basic outer readiness before any futile start: the public gateway must NOT
+# route through the tunnel and must be reachable (scutil, not ICMP). This
+# prevents obviously doomed starts behind captive portals or dead Wi-Fi; it
+# does NOT prove general Internet health (consult §auto-heal).
+monitor_network_ready() {
+  local gw_if
+  gw_if="$(route_interface "$VPN_HOST" 2>/dev/null || true)"
+  case "$gw_if" in ''|utun[0-9]*) return 1 ;; esac
+  /usr/sbin/scutil -r "$VPN_HOST" 2>/dev/null | /usr/bin/grep -q Reachable
+}
+
+# One heal cycle over the EXISTING privileged surface only: helper stop,
+# wait out the old process (best-effort), helper start with stored
+# credentials (identical plumbing to cmd_start via try_helper_start_n).
+# Returns 0 ok/dry-run, 1 failed
+# attempt, 2 network-deferred (no helper start issued; caller must NOT
+# charge the retry budget), 3 stop refused (consult: enter the circuit
+# breaker).
+monitor_heal() {
+  local pass token stop_rc=0
+  if [ "${AUCKLAND_VPN_DRY_RUN:-}" = "1" ]; then
+    echo "[dry-run] would run: $SUDO_BIN -n $HELPER_BIN stop"
+    echo "[dry-run] would run: $SUDO_BIN -n $HELPER_BIN start (with stored credentials)"
+    return 0
+  fi
+  if ! monitor_network_ready; then
+    monitor_log "heal=deferred reason=network-not-ready"
+    echo "monitor: network not ready (gateway unreachable or mis-routed) — deferring heal."
+    return 2
+  fi
+
+  # STOP phase — never via cmd_stop, which would clear the user's intent.
+  if [ -x "$HELPER_BIN" ]; then
+    "$SUDO_BIN" -n "$HELPER_BIN" stop >/dev/null 2>&1 || stop_rc=$?
+    if [ "$stop_rc" -ne 0 ]; then
+      monitor_log "heal=stop-refused rc=$stop_rc"
+      notify_user "VPN auto-heal paused: helper refused stop (stale pidfile?)"
+      return 3
+    fi
+  fi
+  wait_until_vpn_gone
+
+  # START phase with the SAME credential lookups cmd_start performs.
+  if [ -z "$VPN_USER" ]; then
+    monitor_log "heal=blocked reason=no-username"
+    notify_user "VPN auto-heal blocked: no username configured — run: auckland-vpn setup"
+    return 1
+  fi
+  pass="$(stored_vpn_password)"
+  if [ -z "$pass" ] && [ -s "$PASSWORD_FILE" ]; then
+    pass="$(cat "$PASSWORD_FILE")"
+  fi
+  if [ -z "$pass" ]; then
+    monitor_log "heal=blocked reason=no-password"
+    notify_user "VPN auto-heal blocked: no stored password — run: auckland-vpn setup"
+    return 1
+  fi
+  case "$pass" in
+    *$'\n'*)
+      monitor_log "heal=blocked reason=password-newline"
+      notify_user "VPN auto-heal blocked: stored password unusable — run: auckland-vpn setup"
+      return 1
+      ;;
+  esac
+  token="$(read_token_secret)"
+  if [ -z "$token" ]; then
+    monitor_log "heal=blocked reason=no-totp"
+    notify_user "VPN auto-heal blocked: no TOTP secret — run: auckland-vpn setup"
+    return 1
+  fi
+
+  # Launch phase under the intent lock (hostile review 2026-10-03): the
+  # recheck + privileged start must be one transaction against cmd_stop,
+  # which holds the same lock across its intent clear + stop. Without it a
+  # user 'stop' can complete between the recheck and the start, and the
+  # tunnel the user just killed comes back to life. The helper's own
+  # operation lock serializes individual privileged commands, not this
+  # wrapper-side window.
+  intent_lock_acquire
+  if ! monitor_intent_up; then
+    intent_lock_release
+    monitor_log "heal=cancelled reason=intent-down"
+    echo "monitor: intent-down — explicit stop during heal; cancelling start."
+    return 0
+  fi
+
+  # A same-server client already runs (started outside the recorded pidfile):
+  # launching beside it would fight over utun/DNS/routes — skip the start.
+  # The next observation should see the live tunnel as healthy. The check
+  # demands OUR host in the process command line: a recycled PID running
+  # some other server's openconnect must not suppress this restart.
+  local already_running
+  already_running="$(running_vpn_pid || true)"
+  if [ -n "$already_running" ]; then
+    intent_lock_release
+    monitor_log "heal=skipped reason=already-running pid=$already_running"
+    echo "monitor: tunnel already running (pid $already_running) — skipping heal start."
+    return 0
+  fi
+
+  if ! try_helper_start_n "$pass" "$token"; then
+    intent_lock_release
+    if [[ "$HELPER_START_ERR" == *"a password is required"* ]]; then
+      monitor_log "heal=blocked reason=sudo-password-required"
+      notify_user "VPN auto-heal blocked: passwordless sudo unavailable — run: auckland-vpn setup-sudo"
+    else
+      monitor_log "heal=start-failed"
+      notify_user "VPN automatic restart failed — see auckland-vpn log"
+    fi
+    return 1
+  fi
+  intent_lock_release   # launch complete: the transaction's window ends here
+
+  if verify_tunnel_started >/dev/null 2>&1; then
+    monitor_log "heal=recovered"
+    notify_user "VPN connection recovered automatically"
+    return 0
+  fi
+  monitor_log "heal=start-unverified"
+  notify_user "VPN restarted automatically but health is unconfirmed"
+  return 1
+}
+
+# Execute an emitted action record — the ONLY place healing becomes real.
+monitor_act() { # monitor_act <record-line>
+  local record="$1" action
+  case "$record" in *action=*) ;; *) return 0 ;; esac
+  action="${record#*action=}"
+  action="${action%% *}"
+  case "$action" in
+    WOULD_RESTART)
+      if ! monitor_intent_up; then
+        echo "monitor: tunnel down but 'start' did not mark it wanted — not healing."
+        monitor_log "skip=intent-down"
+        return 0
+      fi
+      # A network deferral issues no helper start, so it must not consume
+      # the retry budget the state machine just charged: undo this pass's
+      # increment and clear any backoff debt (a non-attempt earns no wait),
+      # and let the next pass re-evaluate. Any other outcome keeps the
+      # charged attempt.
+      local _heal_rc=0
+      monitor_heal || _heal_rc=$?
+      if [ "$_heal_rc" -eq 2 ]; then
+        restart_attempts=$((restart_attempts - 1))
+        [ "$restart_attempts" -ge 0 ] || restart_attempts=0
+        next_attempt=0
+        return 0
+      fi
+      return "$_heal_rc"
+      ;;
+    notify)
+      notify_user "VPN auto-heal paused after repeated failures (circuit open)"
+      return 0
+      ;;
+    *) return 0 ;;
+  esac
+}
+
+cmd_monitor() {
+  local once=0 observed now record
+  case "${1:-}" in
+    "") : ;;
+    --once) once=1 ;;
+    *) die "usage: auckland-vpn monitor [--once]" ;;
+  esac
+  [ "$(id -u)" -ne 0 ] || die "run the monitor as your own user, not root (it needs YOUR Keychain)."
+  monitor_validate_config
+  ensure_state_dir
+  monitor_lock_acquire
+  trap 'monitor_lock_release; intent_lock_release' EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  load_monitor_state || monitor_log "state=corrupt action=reset"
+  [ -x "$HELPER_BIN" ] || echo "warning: helper not installed ($HELPER_BIN) — observing only, healing disabled. Run: auckland-vpn setup-sudo" >&2
+
+  # Foreground poll loop (default interval 20s). Sleep naturally resumes at
+  # wake, so each pass observes immediately after suspend/network changes;
+  # the state machine's NETWORK_SETTLE_GRACE supplies the wake-settle patience
+  # the consult asks for — no private macOS event APIs involved.
+  local rec="$STATE_DIR/.monitor-rec"
+  while :; do
+    observed="$(observe_state)"
+    now="$(date +%s)"
+    if ! monitor_intent_up && [ "$observed" != healthy ]; then
+      # Desired down (or never started via 'start'): never probe-and-heal.
+      current_state=idle
+      record="state=idle action=none reason=intent-down"
+    else
+      # Captured via redirect, NOT command substitution: $( ) would run the
+      # step in a subshell and silently DISCARD the counter mutations that
+      # drive backoff and the circuit breaker.
+      state_machine_step "$observed" "$now" >"$rec" || true
+      record="$(cat "$rec")"
+      rm -f "$rec"
+    fi
+    echo "monitor: observation=$observed $record"
+    case "$record" in
+      *action=WOULD_RESTART*|*action=notify*)
+        if ! monitor_act "$record"; then
+          monitor_log "act=failed record=$record"
+        fi
+        ;;
+    esac
+    monitor_log "observation=$observed $record"
+    save_monitor_state || monitor_log "warn=state-save-failed"
+    if [ "$once" -eq 1 ]; then break; fi
+    sleep "$INTERVAL"
+  done
+}
+
 
 cmd_pin() {
   command -v openssl >/dev/null 2>&1 \
@@ -907,7 +2056,8 @@ cmd_pin() {
 
 # One command that names everything broken, with the exact fix for each.
 # Prints one line per check — "OK <thing>" or "FIX <thing> — <exact
-# command>" — and exits non-zero when anything needs fixing. Read-only except
+# command>" — plus advisory "WARN"/"INFO" lines that never affect the exit
+# code — and exits non-zero when anything needs fixing. Read-only except
 # for a throwaway write test in the state dir; never prompts for sudo.
 cmd_doctor() {
   local fixes=0 last_err
@@ -950,15 +2100,29 @@ cmd_doctor() {
   fi
 
   if [ ! -x "$HELPER_BIN" ]; then
-    echo "FIX  privileged helper missing — 'start' will ask for your Mac password once. Install with: auckland-vpn setup-sudo"
+    echo "FIX  privileged helper missing — 'start' refuses until it is installed. Install with: auckland-vpn setup-sudo"
     fixes=$((fixes + 1))
-  elif sudo -n -l "$HELPER_BIN start" >/dev/null 2>&1 && sudo -n -l "$HELPER_BIN stop" >/dev/null 2>&1; then
-    # -l <cmd> exits 0 only when sudoers policy actually allows the command;
-    # checking BOTH exact invocations avoids false OK from generic privileges.
-    echo "OK   helper installed ($HELPER_BIN) and passwordless sudo allows it"
   else
-    echo "FIX  helper installed but sudoers does not allow it — re-run: auckland-vpn setup-sudo"
-    fixes=$((fixes + 1))
+    # Separate operands: sudo matches "<helper> start" as ONE argv element
+    # against nothing real, so the old single-string probe always reported
+    # FIX on healthy installs. Both exact invocations are checked because a
+    # generic sudo grant must not read as helper authorisation.
+    sudo_start_out=""; sudo_stop_out=""
+    sudo_start_rc=0; sudo_stop_rc=0
+    sudo_start_out="$("$SUDO_BIN" -n -ll "$HELPER_BIN" start 2>/dev/null)" || sudo_start_rc=$?
+    sudo_stop_out="$("$SUDO_BIN" -n -ll "$HELPER_BIN" stop 2>/dev/null)" || sudo_stop_rc=$?
+    if [ "$sudo_start_rc" -eq 0 ] && [ "$sudo_stop_rc" -eq 0 ]; then
+      # macOS sudo -ll exposes the authentication option; -l omits it.
+      if grep -q 'Options: !authenticate' <<<"$sudo_start_out" \
+          && grep -q 'Options: !authenticate' <<<"$sudo_stop_out"; then
+        echo "OK   helper installed ($HELPER_BIN) and passwordless sudo allows it (start, stop)"
+      else
+        echo "OK   helper installed ($HELPER_BIN) and sudo authorises it (start, stop) — passwordless not confirmed; if 'start' prompts for a password, re-run: auckland-vpn setup-sudo"
+      fi
+    else
+      echo "FIX  helper installed but sudoers does not allow it — re-run: auckland-vpn setup-sudo"
+      fixes=$((fixes + 1))
+    fi
   fi
 
   if mkdir -p "$STATE_DIR" 2>/dev/null && chmod 700 "$STATE_DIR" 2>/dev/null \
@@ -979,7 +2143,137 @@ cmd_doctor() {
       echo "OK   no errors in current log"
     fi
   else
-    echo "INFO no log yet ($LOG_FILE) — nothing has connected from this account."
+    echo "INFO no log yet ($LOG_FILE) — re-run 'auckland-vpn setup-sudo' if the helper is installed."
+  fi
+
+  # PATH hygiene (issue #69) — advisory WARNs, never a FIX: several tools are
+  # still resolved through the inherited PATH, so a group- or world-writable
+  # directory anywhere in an entry's ancestor chain would let another local
+  # user plant a trojaned tool where the wrapper picks it up. Same write-bit
+  # rules as path_is_trusted (other-write always bad; group-write only
+  # tolerable for the admin group, gid 80; ownership deliberately NOT checked
+  # — only writability matters for PATH resolution) but reported, not
+  # enforced — hardening the unqualified calls themselves is #55's lane.
+  # One known inert ancestor is exempt: Apple's SIP-protected Cryptexes dir
+  # (root:wheel 777, unwritable even to root — see path_hygiene_sip_exempt).
+  local entry p pmode pgid pown rn key t finding hops shown=0 warn_total=0 excluded=0
+  local pending seen
+  if [ -n "${PATH:-}" ]; then
+    while IFS= read -r entry; do
+      if [ -z "$entry" ]; then
+        warn_total=$((warn_total + 1))
+        if [ "$shown" -lt 5 ]; then
+          shown=$((shown + 1))
+          echo "WARN  PATH contains an empty entry (means the current directory) — remove it from PATH"
+        fi
+        continue
+      fi
+      # Walk the entry's chain AND, for every symlink met, the ancestor
+      # chain holding the link: a writable directory containing the link
+      # can swap it out from under a clean target, and the old walk jumped
+      # straight to the target without ever examining the link's parents.
+      # Directories are keyed by physical identity (link-holder and target
+      # chains share ancestor prefixes; each is reported once) — but a
+      # symlink is keyed by its LITERAL path: pwd -P of a link names its
+      # TARGET, so keying a link physically would mark the target 'seen'
+      # before anything validated it, and a clean link to a world-writable
+      # directory sailed through as OK (hostile review 2026-10-03).
+      pending="$entry
+"
+      seen="|"
+      hops=0
+      while [ -n "$pending" ]; do
+        p="${pending%%$'\n'*}"
+        pending="${pending#*$'\n'}"
+      while :; do
+        [ -e "$p" ] || break
+        if [ -L "$p" ]; then
+          key="$p"
+        else
+          key="$(cd -- "$p" 2>/dev/null && /bin/pwd -P 2>/dev/null)" || key="$p"
+        fi
+        case "$seen" in
+          *"|$key|"*) : ;;
+          *)
+        seen="$seen$key|"
+        pmode="$(/usr/bin/stat -f '%Lp' "$p" 2>/dev/null)" || break
+        finding=""
+        case "$pmode" in
+          *[2367])
+            pown="$(/usr/bin/stat -f '%u:%g' "$p" 2>/dev/null)" || break
+            # canonical spelling: symlink targets can carry ../ (the stock
+            # cryptex PATH entry does), and both the exemption and the
+            # report should name the real path
+            rn="$(cd -- "$p" 2>/dev/null && /bin/pwd -P)" || rn="$p"
+            if path_hygiene_sip_exempt "$rn" "$pown"; then
+              excluded=$((excluded + 1))
+            else
+              finding="world-writable component: $rn (mode $pmode)"
+            fi
+            ;;
+          *[2367]?)
+            pgid="$(/usr/bin/stat -f '%g' "$p" 2>/dev/null)" || break
+            [ "$pgid" = "80" ] || finding="group-writable component: $p (mode $pmode, group not admin)"
+            ;;
+        esac
+        if [ -n "$finding" ]; then
+          warn_total=$((warn_total + 1))
+          if [ "$shown" -lt 5 ]; then
+            shown=$((shown + 1))
+            echo "WARN  PATH entry $entry has a $finding"
+          fi
+        fi
+            ;;
+        esac
+        if [ -L "$p" ]; then
+          # Remember the link-holder's own chain for the same treatment;
+          # then keep checking via the link target as before.
+          pending="$pending$(/usr/bin/dirname "$p")
+"
+          hops=$((hops + 1))
+          [ "$hops" -gt 16 ] && break               # symlink loop / absurd chain
+          t="$(/usr/bin/readlink "$p")"
+          case "$t" in
+            /*) p="$t" ;;
+            *)  p="$(/usr/bin/dirname "$p")/$t" ;;
+          esac
+          continue
+        fi
+        [ "$p" != "/" ] || break
+        p="$(/usr/bin/dirname "$p")"
+      done
+      done
+    done < <(printf '%s\n' "$PATH" | tr ':' '\n')
+    if [ "$excluded" -gt 0 ]; then
+      echo "INFO PATH hygiene: $excluded Apple SIP-protected component(s) skipped (root:wheel under /System/Volumes/Preboot/Cryptexes)"
+    fi
+    if [ "$warn_total" -eq 0 ]; then
+      echo "OK   PATH hygiene: no group/world-writable component on any PATH entry"
+    elif [ "$warn_total" -gt "$shown" ]; then
+      echo "INFO PATH hygiene: $warn_total findings on PATH; showing the first $shown"
+    fi
+  fi
+
+  # Monitor status — informational only, never a FIX: is a monitor process
+  # alive (lock holder first, scoped pgrep as fallback), and what state did
+  # it last record?
+  local mon_pid mon_state
+  mon_pid="$(cat "$MONITOR_LOCK_DIR/pid" 2>/dev/null || true)"
+  case "$mon_pid" in
+    ''|*[!0-9]*)
+      mon_pid="$(pgrep -f 'auckland-vpn monitor' 2>/dev/null | head -n 1 || true)"
+      ;;
+  esac
+  if [ -n "$mon_pid" ] && kill -0 "$mon_pid" 2>/dev/null; then
+    echo "OK   monitor running (pid $mon_pid)"
+  else
+    echo "INFO monitor not running — optional:  nohup auckland-vpn monitor &  (see README)"
+  fi
+  mon_state="$(sed -n 's/^current_state=//p' "$MONITOR_STATE_FILE" 2>/dev/null || true)"
+  if [ -n "$mon_state" ]; then
+    echo "INFO monitor last recorded state: $mon_state"
+  else
+    echo "INFO no monitor state recorded yet"
   fi
 
   if [ "$fixes" -gt 0 ]; then
@@ -989,11 +2283,75 @@ cmd_doctor() {
   echo "All checks passed."
 }
 
-# Self-update: replace the installed copy with the latest from GitHub.
-# Resolves the real install path (command -v), downloads to the private
-# state dir, syntax-checks before installing, and skips when already current.
-# Uses sudo only if the target isn't user-writable. After updating, re-run
-# setup-sudo: the helper embeds paths at install time.
+# One-shot triage (issue #15): doctor's prerequisite checks, then analysis of
+# the CURRENT attempt's log section — failure-class markers per the audit
+# table, the login-realm evidence check, and transport/DNS findings.
+# Strictly read-only: no connection attempt, no privileged action. Exit 1
+# only when there is no log to analyse at all.
+cmd_diagnose() {
+  local attempt hit
+  echo "== auckland-vpn diagnose =="
+  cmd_doctor || true   # prerequisite findings must not stop log analysis
+
+  echo "--- current attempt (since the last 'start' banner) ---"
+  if [ ! -f "$LOG_FILE" ]; then
+    echo "No log file yet ($LOG_FILE). Connect once first:  auckland-vpn start"
+    return 1
+  fi
+  attempt="$(attempt_log)"
+  if [ -z "$attempt" ]; then
+    echo "(no start banner in the log yet — showing the last 20 lines)"
+    tail -n 20 "$LOG_FILE"
+    return 0
+  fi
+  printf '%s\n' "$attempt"
+
+  echo "--- findings ---"
+  # Authentication classes are deliberately conservative: FortiGate cannot
+  # reliably distinguish wrong-password from wrong-token (audit §1).
+  if grep -q 'Server is rejecting the soft token\|Failed to generate OTP tokencode' <<<"$attempt"; then
+    echo "AUTH:      token-specific failure — refresh the TOTP secret:  auckland-vpn setup"
+  elif grep -q 'Invalid credentials; try again' <<<"$attempt"; then
+    echo "AUTH:      \"Invalid credentials\" — password OR token rejected (the server cannot say which). Refresh BOTH together:  auckland-vpn setup"
+  else
+    echo "AUTH:      no authentication-failure markers in this attempt."
+  fi
+
+  # Login realm evidence (audit §1): a successful connect logs this line.
+  if grep -q "Got login realm 'client'" <<<"$attempt"; then
+    echo "REALM:     ok — \"Got login realm 'client'\" present."
+  else
+    echo "REALM:     WARNING — \"Got login realm 'client'\" NOT found. If connecting also failed, investigate the realm/URL path before blaming credentials: the /client URL path only becomes realm 'client' if the gateway redirects to a URL containing realm=client (audit §1)."
+  fi
+
+  # DNS application classes (audit §5).
+  if grep -q 'Got split-DNS' <<<"$attempt"; then
+    echo "DNS:       server pushed split-DNS that OpenConnect 9.x does NOT implement (known upstream limitation — see README)."
+  fi
+  if grep -q 'Got IPv4 DNS server' <<<"$attempt"; then
+    echo "DNS:       VPN DNS servers were pushed ('Got IPv4 DNS server' lines above)."
+  else
+    echo "DNS:       no 'Got IPv4 DNS server' lines — the server pushed no DNS servers."
+  fi
+
+  # Transport classes (audit §2): DTLS preferred; TLS fallback still works.
+  if grep -q 'Established DTLS connection\|DTLS is enabled on port' <<<"$attempt"; then
+    echo "TRANSPORT: DTLS established."
+  elif grep -q 'PPP over TLS' <<<"$attempt"; then
+    echo "TRANSPORT: carrying traffic over PPP/TLS fallback (works; TCP-heavy transfers slower)."
+  else
+    echo "TRANSPORT: no DTLS/TLS marker in this attempt."
+  fi
+
+  hit="$(grep -i 'reconnect' <<<"$attempt" | tail -n 3 || true)"
+  if [ -n "$hit" ]; then
+    echo "--- reconnect-policy lines (cookie reuse is server-dependent; audit §3) ---"
+    printf '%s\n' "$hit"
+  fi
+  return 0
+}
+
+# Self-update: syntax-check the downloaded script before replacing this copy.
 cmd_update() {
   local repo="${AUCKLAND_VPN_REPO:-JavaGT/auckland-vpn}"
   local branch="${AUCKLAND_VPN_BRANCH:-main}"
@@ -1019,9 +2377,9 @@ cmd_update() {
     :
   else
     echo "Need sudo to write $target ..."
-    sudo cp "$tmp" "$target" || die "could not install update to $target"
+    "$SUDO_BIN" cp "$tmp" "$target" || die "could not install update to $target"
   fi
-  chmod +x "$target" 2>/dev/null || sudo chmod +x "$target"
+  chmod +x "$target" 2>/dev/null || "$SUDO_BIN" chmod +x "$target"
   rm -f "$tmp"
   echo "Updated $target."
   echo "If you use passwordless start, re-run: auckland-vpn setup-sudo"
@@ -1034,13 +2392,16 @@ auckland-vpn — reliable University of Auckland VPN (FortiNet + TOTP 2FA)
   setup       one-time: store VPN password (Keychain) + TOTP secret
   setup-sudo  one sudo prompt: install root-owned helper + restricted sudoers rule
   start       connect (auto 2FA, auto-reconnect; verifies the tunnel came up;
-              asks for your Mac password once unless setup-sudo is done)
+              needs the privileged helper installed by setup-sudo)
   stop        disconnect
-  restart     stop, confirm gone, then start
+  restart     stop, wait out the old process, then start
   status      Connected as ... (pid, IP) / Connecting... / Not connected.
+  monitor     supervise the tunnel and auto-restart it when it dies [--once]
+              (only heals tunnels that 'start' marked as wanted)
   log         last 50 log lines ('log -f' follows until Ctrl-C)
   pin         print the current server certificate fingerprint
   doctor      check every prerequisite; prints OK/FIX + exact fix per item
+  diagnose    doctor checks + failure-class analysis of the last attempt
   update      self-update to the latest version from GitHub
 
 Examples:
@@ -1066,9 +2427,11 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     stop)        cmd_stop ;;
     restart)     cmd_restart ;;
     status)      cmd_status ;;
+    monitor)     shift; cmd_monitor "$@" ;;
     log)         shift; cmd_log "$@" ;;
     pin)         cmd_pin ;;
     doctor)      cmd_doctor ;;
+    diagnose)    cmd_diagnose ;;
     update)      cmd_update ;;
     -h|--help|help) usage ;;
     *) usage; exit 2 ;;
